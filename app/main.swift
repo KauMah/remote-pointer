@@ -207,6 +207,16 @@ enum SystemAction {
                                            configuration: NSWorkspace.OpenConfiguration())
     }
 
+    /// Open Notification Center shows as a large on-screen window owned by "Notification Center" (none when closed).
+    static func notificationCenterOpen() -> Bool {
+        let wins = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return wins.contains { w in
+            guard (w[kCGWindowOwnerName as String] as? String) == "Notification Center",
+                  let b = w[kCGWindowBounds as String] as? [String: Any], let h = b["Height"] as? Double else { return false }
+            return h > 300
+        }
+    }
+
     /// Notification Center has no public API: press the menu-bar Clock (what clicking it does). On current macOS the
     /// clock is an AXMenuBarItem nested in a group under MenuBarAgent's extras menu bar; older versions host it in
     /// ControlCenter. Search both, preferring an item described "Clock", else the right-most extra.
@@ -461,7 +471,7 @@ final class Pointer {
 
     // Touch gesture state
     enum TouchMode { case undecided, point, scroll, edge(EdgeGesture), pinch, done }
-    enum EdgeGesture { case notificationCenter }
+    enum EdgeGesture { case notificationCenter, dismissNotificationCenter }
     var mode: TouchMode = .undecided
     var touchStart: (x: Double, y: Double) = (0, 0)
     var smooth: (x: Double, y: Double) = (0, 0)
@@ -676,7 +686,12 @@ final class Pointer {
         case .scroll:
             scroller.fingerMoved(dx: smooth.x - prev.x, dy: smooth.y - prev.y, dt: dt)
         case .edge(let g):
-            let inward = -moved.x                                // from the right edge, moving left
+            let inward: Double
+            switch g {
+            case .notificationCenter: inward = -moved.x          // from the right edge, moving left
+            case .dismissNotificationCenter:                     // from inside, out over the right edge
+                inward = x > Self.rightEdgeStart ? moved.x : 0
+            }
             if inward > Self.edgeTrigger {
                 mode = .done
                 mouse.rewind(0.4)
@@ -693,13 +708,14 @@ final class Pointer {
     }
 
     func edgeCandidate(_ x: Double, _ y: Double) -> EdgeGesture? {
-        x > Self.rightEdgeStart ? .notificationCenter : nil
+        if SystemAction.notificationCenterOpen() { return x < Self.rightEdgeStart ? .dismissNotificationCenter : nil }
+        return x > Self.rightEdgeStart ? .notificationCenter : nil
     }
 
     func fire(_ g: EdgeGesture) {
         log("edge gesture: \(g)")
         switch g {
-        case .notificationCenter: SystemAction.notificationCenter()
+        case .notificationCenter, .dismissNotificationCenter: SystemAction.notificationCenter()   // the clock toggles it
         }
     }
 
@@ -943,7 +959,7 @@ final class StatusMenu: NSObject {
         add("Natural Scrolling", #selector(toggleNatural), on: Defaults.naturalScroll)
         menu.addItem(.separator())
         add("Edge Swipe for Notification Center", #selector(toggleEdges), on: Defaults.edgeGestures)
-        let help = NSMenuItem(title: "Swipe left from the right edge of the touch surface", action: nil, keyEquivalent: "")
+        let help = NSMenuItem(title: "Swipe in from the right edge to open, back out over it to close", action: nil, keyEquivalent: "")
         help.isEnabled = false
         menu.addItem(help)
         menu.addItem(.separator())
