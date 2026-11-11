@@ -97,3 +97,7 @@ The menu bar menu has sliders for pointer speed, acceleration, scroll speed and 
 - This relies on private macOS frameworks and undocumented remote commands, so a macOS update could break it.
 - Only tested with the 1st-gen Siri Remote (A1513).
 - The remote goes to sleep after about 40 s without input. A click wakes it.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md): you're free to use, study, modify and share this for any noncommercial purpose, including personal projects, research, hobby use and use by schools or nonprofits. Commercial use is not permitted. If you'd like to use it commercially, open an issue to ask.
