@@ -4,7 +4,7 @@
 // pitch → y). Lift to disengage. Swipe = trackpad-style scroll (axis-locked, with momentum). Swipe left from
 // the right edge = Notification Center. Click the surface = left click,
 // TV = right click (2× Return, 3× Mission Control, hold = app switcher: turn to pick, release to switch), Play/Pause = play/pause (2× fast-forward, 3× rewind,
-// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[), Siri = dictation (hold to talk, tap to toggle). Cursor motion is posted as HID-level mouse
+// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle). Cursor motion is posted as HID-level mouse
 // events with deltas, so Universal Control can carry it across to a nearby iPad/Mac.
 //
 // How motion is unlocked: BTLEServer forwards feature-report SETs on any of the remote's HID interfaces to the
@@ -370,7 +370,7 @@ final class Pointer {
             default: self.mouse.mediaKey(20)
             }
         },
-        onHold: { [unowned self] in self.mouse.key(50, flags: .maskCommand) },     // ⌘`
+        onHold: { [unowned self] _ in self.mouse.key(50, flags: .maskCommand) },   // ⌘`
         holdRepeat: 0.7)
     // TV/Home: 1× right click, 2× Return, 3× Mission Control; hold = app switcher (turn left/right to pick, release to switch).
     lazy var tvClicks = ClickCounter(
@@ -381,7 +381,7 @@ final class Pointer {
             default: SystemAction.missionControl()
             }
         },
-        onHold: { [unowned self] in
+        onHold: { [unowned self] _ in
             self.mouse.modifier(55, .maskCommand, down: true)
             self.mouse.key(48, flags: .maskCommand)       // ⌘Tab opens the switcher on the next app
             self.switcherActive = true; self.switcherAccum = 0; self.switcherStart = now()
@@ -391,6 +391,15 @@ final class Pointer {
             self.switcherActive = false
             self.mouse.modifier(55, .maskCommand, down: false)   // releasing ⌘ switches to the selection
         })
+    // Menu: 1× Back (⌘[), 2× Backspace; press then press-and-hold = delete word by word (⌥⌫, repeating).
+    lazy var menuClicks = ClickCounter(
+        maxCount: 2,
+        onClicks: { [unowned self] n in
+            if n == 1 { self.mouse.key(0x21, flags: .maskCommand) }   // ⌘[
+            else { self.mouse.key(51) }                               // ⌫
+        },
+        onHold: { [unowned self] n in if n >= 2 { self.mouse.key(51, flags: .maskAlternate) } },  // ⌥⌫
+        holdRepeat: 0.25)
     // App switcher: while TV is held, turning the remote left/right moves the selection (faster turn = more apps).
     var switcherActive = false
     var switcherAccum = 0.0
@@ -583,7 +592,7 @@ final class Pointer {
         }
         if let down = went(0x08) { down ? playClicks.down() : playClicks.up() }   // Play/Pause (see playClicks)
         if let down = went(0x01) { down ? tvClicks.down() : tvClicks.up() }       // TV/Home (see tvClicks)
-        if went(0x20) == true { mouse.key(0x21, flags: .maskCommand) }       // Menu → ⌘[ (Back)
+        if let down = went(0x20) { down ? menuClicks.down() : menuClicks.up() }   // Menu (see menuClicks)
         if let down = went(0x10) {            // Siri → dictation: hold = push-to-talk, quick tap = toggle
             let d = Dictation.shared
             if down {
@@ -837,7 +846,7 @@ final class StatusMenu: NSObject {
 final class ClickCounter {
     let maxCount: Int
     let onClicks: (Int) -> Void
-    let onHold: (() -> Void)?
+    let onHold: ((Int) -> Void)?
     let holdRepeat: Double?
     let onHoldEnd: (() -> Void)?
     static let holdAfter = 0.45
@@ -845,7 +854,7 @@ final class ClickCounter {
     private var clickTimer: Timer?, holdTimer: Timer?, repeatTimer: Timer?
     private var holding = false
 
-    init(maxCount: Int = 3, onClicks: @escaping (Int) -> Void, onHold: (() -> Void)? = nil,
+    init(maxCount: Int = 3, onClicks: @escaping (Int) -> Void, onHold: ((Int) -> Void)? = nil,
          holdRepeat: Double? = nil, onHoldEnd: (() -> Void)? = nil) {
         self.maxCount = maxCount; self.onClicks = onClicks; self.onHold = onHold
         self.holdRepeat = holdRepeat; self.onHoldEnd = onHoldEnd
@@ -857,11 +866,12 @@ final class ClickCounter {
         guard let onHold else { if count >= maxCount { fire() }; return }
         holdTimer = Timer.scheduledTimer(withTimeInterval: Self.holdAfter, repeats: false) { [weak self] _ in
             guard let self else { return }
+            let n = self.count
             self.holding = true; self.count = 0
-            log("hold")
-            onHold()
+            log("hold after \(n) press(es)")
+            onHold(n)
             if let r = self.holdRepeat {
-                self.repeatTimer = Timer.scheduledTimer(withTimeInterval: r, repeats: true) { _ in onHold() }
+                self.repeatTimer = Timer.scheduledTimer(withTimeInterval: r, repeats: true) { _ in onHold(n) }
             }
         }
     }
