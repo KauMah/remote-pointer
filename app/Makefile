@@ -6,7 +6,7 @@ INSTALL_DIR := $(HOME)/Applications
 SWIFTFLAGS := -O -swift-version 5 -import-objc-header mt.h
 FRAMEWORKS := -framework IOKit -framework AppKit -framework CoreGraphics -framework ApplicationServices -framework QuartzCore -framework ServiceManagement -framework Speech -framework AVFoundation
 
-SOURCES := main.swift Dictation.swift
+SOURCES := main.swift Dictation.swift VirtualMouse.swift
 
 # Info.plist is embedded in the binary too, so `make run` has usage strings for the mic/speech prompts.
 $(BIN): $(SOURCES) mt.h Info.plist

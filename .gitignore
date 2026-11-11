@@ -16,3 +16,5 @@ c6-probe/sdkconfig.old
 !axes.log
 !enable.log
 .DS_Store
+helper/rp-hid-helper
+helper/.deps/

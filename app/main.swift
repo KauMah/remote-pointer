@@ -85,6 +85,11 @@ final class Mouse {
         let ix = accX.rounded(.towardZero), iy = accY.rounded(.towardZero)
         guard ix != 0 || iy != 0 else { return }
         accX -= ix; accY -= iy
+        if VirtualMouse.shared.ensureConnected() {             // real-HID path: Universal Control follows it
+            VirtualMouse.shared.move(dx: ix, dy: iy)
+            if record { let t = now(); history.append((t, ix, iy)); history.removeAll { t - $0.t > 0.25 } }
+            return
+        }
         let from = location
         let to = clampToDisplays(CGPoint(x: from.x + ix, y: from.y + iy), from: from)
         let type: CGEventType = leftDown ? .leftMouseDragged : .mouseMoved
@@ -124,6 +129,10 @@ final class Mouse {
             lastClickTime = t; lastClickPos = p
         }
         if button == .left { leftDown = down }
+        if VirtualMouse.shared.ensureConnected() {
+            VirtualMouse.shared.button(button == .left ? 1 : 2, down: down)   // the system counts double-clicks itself
+            return
+        }
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
         e.setIntegerValueField(.mouseEventClickState, value: Int64(button == .left ? clickCount : 1))
         stamp(e)
@@ -1019,6 +1028,11 @@ final class StatusMenu: NSObject {
         let status = NSMenuItem(title: Remote.shared.connected ? "Siri Remote connected" : "Siri Remote not connected", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        let vm = NSMenuItem(title: VirtualMouse.shared.connected ? "Universal Control: virtual mouse on"
+                                                                  : "Universal Control: off (virtual mouse helper not running)",
+                            action: nil, keyEquivalent: "")
+        vm.isEnabled = false
+        menu.addItem(vm)
         menu.addItem(.separator())
         add("Enabled", #selector(toggleEnabled), on: Defaults.enabled)
         menu.addItem(Cheatsheet.menuItem())
@@ -1194,6 +1208,11 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
 }
 
 StatusMenu.shared.install()
+VirtualMouse.shared.ensureConnected()
+// The driver recreates its device when it reloads, which resets acceleration; reapply now and then.
+Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+    if VirtualMouse.shared.ensureConnected() { VirtualMouse.makeLinear() }
+}
 Dictation.shared.requestPermissions()
 Remote.shared.start()
 Touch.shared.rescan()

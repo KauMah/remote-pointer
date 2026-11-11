@@ -67,6 +67,21 @@ The Makefile signs with your Apple Development identity if you have one, so perm
 
 The menu bar menu has sliders for pointer speed, acceleration, scroll speed and momentum, plus toggles for inversion, natural scrolling, the edge gesture and Open at Login.
 
+## Universal Control (optional)
+
+Synthetic mouse events stay on the Mac that posts them. To carry the pointer to a nearby Mac or iPad, RemotePointer can drive a **virtual HID mouse** instead, which macOS treats like real hardware. This uses the [Karabiner DriverKit VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) driver, which only takes commands from root, so a small root helper (`helper/rp-hid-helper`) owns the device and the app sends it pointer reports over a Unix socket. The socket accepts connections only from your own user account.
+
+```sh
+cd helper
+make                                   # fetches the driver's client headers (needs cmake) and builds the helper
+sudo ./install.sh "$(make -s pkg)"     # installs the driver + launchd daemons (from a folder outside ~/Desktop)
+/Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
+```
+
+Approve the driver in System Settings → General → Login Items & Extensions → Driver Extensions. The menu shows "Universal Control: virtual mouse on" once the app is connected. RemotePointer switches off the system acceleration curve for the virtual mouse only, so its own pointer tuning still applies. Pointer motion and clicks go through the virtual mouse. Scrolling, zoom and keyboard shortcuts are still synthetic, so they act on this Mac.
+
+Root can't read files under `~/Desktop` (macOS privacy protection), so if the repo lives there, copy `helper/` somewhere else before running `install.sh`.
+
 ## How it works (reverse-engineered)
 
 - macOS's `/usr/sbin/BTLEServer` exposes the remote (vid `0x004C`, pid `0x0266`) as several `IOHIDUserDevice`s. Its product name is its serial number.
@@ -84,7 +99,8 @@ The menu bar menu has sliders for pointer speed, acceleration, scroll speed and 
 
 | Path | What |
 |---|---|
-| `app/` | The menu-bar app (`main.swift`, `Dictation.swift`) |
+| `app/` | The menu-bar app (`main.swift`, `Dictation.swift`, `VirtualMouse.swift`) |
+| `helper/` | Root helper that owns the virtual HID mouse, plus its installer |
 | `probe.swift` | Dumps HID interfaces and reports |
 | `mtprobe.c` | Raw MultitouchSupport touch frames |
 | `brute.swift` | Keyhole scanner: `map`, `enable`, `axes`, `raw`, `poke`, `scan`, `siri` |
