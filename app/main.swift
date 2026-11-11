@@ -4,7 +4,7 @@
 // pitch → y). Lift to disengage. Swipe = trackpad-style scroll (axis-locked, with momentum). Swipe left from
 // the right edge = Notification Center. Click the surface = left click,
 // TV = right click (2× Return, 3× Mission Control, hold = app switcher: turn to pick, release to switch), Play/Pause = play/pause (2× fast-forward, 3× rewind,
-// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle), Play/Pause+Siri held = zoom (tilt). Cursor motion is posted as HID-level mouse
+// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle), Play/Pause+Siri held = pinch zoom (tilt), double-tap the surface = smart zoom. Cursor motion is posted as HID-level mouse
 // events with deltas, so Universal Control can carry it across to a nearby iPad/Mac.
 //
 // How motion is unlocked: BTLEServer forwards feature-report SETs on any of the remote's HID interfaces to the
@@ -145,6 +145,28 @@ final class Mouse {
         stamp(e)
         e.flags.formUnion(extraFlags)
         e.post(tap: .cghidEventTap)
+    }
+
+    // Trackpad gesture events (NSEventTypeGesture = 29). Field 110 = HID event type (8 zoom/pinch, 22 zoom
+    // toggle = smart magnify), 113 = magnification delta, 132 = phase (1 began, 2 changed, 4 ended).
+    // Verified: apps receive these as magnify(with:) / smartMagnify(with:).
+    static let gestureType = CGEventType(rawValue: 29)!
+    private func gesture(hidType: Int64, configure: (CGEvent) -> Void) {
+        guard let e = CGEvent(source: nil) else { return }
+        e.type = Self.gestureType
+        e.location = location
+        e.setIntegerValueField(CGEventField(rawValue: 110)!, value: hidType)
+        configure(e)
+        e.post(tap: .cghidEventTap)
+    }
+    /// Two-finger double-tap "smart zoom".
+    func smartMagnify() { gesture(hidType: 22) { _ in } }
+    /// Pinch: phase 1 began, 2 changed, 4 ended; delta is the magnification change (+ zooms in).
+    func magnify(phase: Int64, delta: Double) {
+        gesture(hidType: 8) { e in
+            e.setDoubleValueField(CGEventField(rawValue: 113)!, value: delta)
+            e.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+        }
     }
 
     /// System media key (NX_KEYTYPE_SOUND_UP = 0, SOUND_DOWN = 1).
@@ -381,10 +403,13 @@ final class Pointer {
     var volumeTimer: Timer?
     var siriDownAt = 0.0, siriStartedThisPress = false
     var siriPending: Timer?
-    // Zoom mode (Play/Pause + Siri held): tilting up/down zooms via ⌃-scroll (macOS Accessibility Zoom).
+    // Zoom mode (Play/Pause + Siri held): tilting up/down pinch-zooms the app under the cursor.
     var zoomActive = false
-    var zoomRemainder = 0.0
-    static let zoomPixelsPerDegree = 6.0
+    static let zoomPerDegree = 0.012            // pinch magnification per degree of tilt
+    // Double-tap on the touch surface (no click) = smart zoom.
+    var lastTapEnd = 0.0
+    var clickedThisTouch = false
+    static let tapMaxDuration = 0.22, tapMaxMove = 0.06, doubleTapGap = 0.35
     // NX_KEYTYPE_PLAY = 16, FAST = 19, REWIND = 20 (what the F8/F9/F7 media keys send)
     // Play/Pause: 1× play/pause, 2× fast-forward, 3× rewind; hold = cycle this app's windows (⌘`, repeating).
     lazy var playClicks = ClickCounter(
@@ -518,10 +543,7 @@ final class Pointer {
             let r = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
             var v = abs(r.v) < 2 ? 0 : r.v                        // °/s; tilt up = positive
             if Defaults.invertY { v = -v }
-            zoomRemainder += v / 66.0 * Self.zoomPixelsPerDegree
-            let px = zoomRemainder.rounded(.towardZero)
-            zoomRemainder -= px
-            if px != 0 { mouse.scroll(pixelsX: 0, pixelsY: Int32(px), phase: .none, extraFlags: .maskControl) }
+            if v != 0 { mouse.magnify(phase: 2, delta: v / 66.0 * Self.zoomPerDegree) }   // tilt up = zoom in
             return
         }
         if switcherActive {
@@ -571,7 +593,7 @@ final class Pointer {
             log("touch down at \(String(format: "%.2f,%.2f", x, y))")
             touchStart = (x, y); smooth = (x, y); lastTouchTime = t
             touchTrail = []; pointedThisTouch = 0; touchBeganAt = t; peakSwipeSpeed = 0; maxGyroDuringTouch = 0
-            locked = true; slowSince = 0; filterH.reset(); filterV.reset()
+            locked = true; slowSince = 0; filterH.reset(); filterV.reset(); clickedThisTouch = false
             mode = .undecided
             scroller.touchBegan()
             if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }
@@ -582,6 +604,16 @@ final class Pointer {
                            hypot(smooth.x - touchStart.x, smooth.y - touchStart.y), peakSwipeSpeed, maxGyroDuringTouch, pointedThisTouch))
             }
             if case .scroll = mode { scroller.touchEnded() }
+            var wasPointOrUndecided = false
+            if case .undecided = mode { wasPointOrUndecided = true }
+            if case .point = mode { wasPointOrUndecided = true }
+            if wasPointOrUndecided && !clickedThisTouch && Defaults.enabled && t - touchBeganAt < Self.tapMaxDuration
+                && hypot(x - touchStart.x, y - touchStart.y) < Self.tapMaxMove {
+                if t - lastTapEnd < Self.doubleTapGap + Self.tapMaxDuration {
+                    mouse.rewind(0.3)
+                    mouse.smartMagnify(); log("double tap → smart zoom"); lastTapEnd = 0
+                } else { lastTapEnd = t }
+            }
             mode = .undecided
         }
         touching = down
@@ -646,6 +678,7 @@ final class Pointer {
         let changed = b ^ buttons
         buttons = b
         func went(_ bit: UInt8) -> Bool? { changed & bit == 0 ? nil : (b & bit != 0) }
+        if went(0x80) == true { clickedThisTouch = true; lastTapEnd = 0 }
         if let down = went(0x80) {            // touch-surface click → left button, rewinding the press wobble
             if down { mouse.rewind(0.08) }
             freezeUntil = now() + 0.15
@@ -662,10 +695,11 @@ final class Pointer {
             if Dictation.shared.active { Dictation.shared.cancel() }
             siriStartedThisPress = false
             if !motionActive { Remote.shared.setMotion(true) }
+            mouse.magnify(phase: 1, delta: 0)
             log("zoom mode on")
         }
         if zoomActive {
-            if b & 0x18 == 0 { zoomActive = false; log("zoom mode off") }
+            if b & 0x18 == 0 { zoomActive = false; mouse.magnify(phase: 4, delta: 0); log("zoom mode off") }
             return
         }
         if let down = went(0x10) {            // Siri → dictation: hold = push-to-talk, quick tap = toggle
