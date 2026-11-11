@@ -419,8 +419,11 @@ final class Pointer {
     // remote itself is fairly still, and before this touch has been used to point.
     static let scrollStartDistance = 0.16       // fraction of the surface
     static let swipeMinSpeed = 0.9              // surface widths per second over the last ~120 ms
-    static let pointingGyroLimit = 35.0         // °/s: above this the user is pointing, not swiping
-    static let pointedLockPixels = 25.0         // once the cursor has moved this far in a touch, it stays a point
+    static let pointingGyroLimit = 120.0        // °/s: only a fast sweep of the remote vetoes a swipe
+    static let pointedLockPixels = 80.0         // a touch that has clearly been pointing (this far, for
+    static let pointedLockAge = 0.3             //   at least this long) stays a point
+    var touchBeganAt = 0.0
+    var peakSwipeSpeed = 0.0, maxGyroDuringTouch = 0.0
     var touchTrail: [(t: Double, x: Double, y: Double)] = []
     var gyroSpeed = 0.0                          // smoothed |rotation| in °/s
     var pointedThisTouch = 0.0
@@ -514,13 +517,16 @@ final class Pointer {
         if down && !touching {                                   // touch began
             log("touch down at \(String(format: "%.2f,%.2f", x, y))")
             touchStart = (x, y); smooth = (x, y); lastTouchTime = t
-            touchTrail = []; pointedThisTouch = 0
+            touchTrail = []; pointedThisTouch = 0; touchBeganAt = t; peakSwipeSpeed = 0; maxGyroDuringTouch = 0
             mode = .undecided
             scroller.touchBegan()
             if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }
         }
         if !down && touching {                                   // touch ended
-            log("touch up")
+            if case .scroll = mode { log("touch up (scrolled)") } else {
+                log(String(format: "touch up — no scroll: moved %.2f, peak swipe %.2f/s, max gyro %.0f°/s, pointed %.0f px",
+                           hypot(smooth.x - touchStart.x, smooth.y - touchStart.y), peakSwipeSpeed, maxGyroDuringTouch, pointedThisTouch))
+            }
             if case .scroll = mode { scroller.touchEnded() }
             mode = .undecided
         }
@@ -542,7 +548,8 @@ final class Pointer {
             touchTrail.append((t, x, y))
             touchTrail.removeAll { t - $0.t > 0.12 }
             let recent = touchTrail.first.map { hypot(x - $0.x, y - $0.y) / max(t - $0.t, 0.04) } ?? 0
-            if pointedThisTouch > Self.pointedLockPixels { mode = .point }
+            peakSwipeSpeed = max(peakSwipeSpeed, recent); maxGyroDuringTouch = max(maxGyroDuringTouch, gyroSpeed)
+            if pointedThisTouch > Self.pointedLockPixels && t - touchBeganAt > Self.pointedLockAge { mode = .point }
             if case .undecided = mode,
                hypot(moved.x, moved.y) > Self.scrollStartDistance,
                recent > Self.swipeMinSpeed,
