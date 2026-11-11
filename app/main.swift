@@ -678,8 +678,7 @@ final class Pointer {
                     siriPending = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
                         guard let self else { return }
                         self.siriPending = nil
-                        self.siriStartedThisPress = d.start()
-                        if self.buttons & 0x10 == 0 && self.siriStartedThisPress { d.stop() }   // already released: tap → keep going
+                        self.siriStartedThisPress = d.start()   // a quick tap leaves it running (toggle mode)
                     }
                 }
             } else {
