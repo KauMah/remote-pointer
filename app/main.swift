@@ -4,7 +4,7 @@
 // pitch → y). Lift to disengage. Swipe = trackpad-style scroll (axis-locked, with momentum). Swipe left from
 // the right edge = Notification Center. Click the surface = left click,
 // TV = right click (2× Return, 3× Mission Control, hold = app switcher: turn to pick, release to switch), Play/Pause = play/pause (2× fast-forward, 3× rewind,
-// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle). Cursor motion is posted as HID-level mouse
+// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle), Play/Pause+Siri held = zoom (tilt). Cursor motion is posted as HID-level mouse
 // events with deltas, so Universal Control can carry it across to a nearby iPad/Mac.
 //
 // How motion is unlocked: BTLEServer forwards feature-report SETs on any of the remote's HID interfaces to the
@@ -137,12 +137,13 @@ final class Mouse {
 
     /// Trackpad-style pixel scroll with gesture/momentum phases, so AppKit treats it like a real trackpad
     /// (smooth scrolling, rubber-banding at edges). Positive dy reveals content above, positive dx content to the left.
-    func scroll(pixelsX dx: Int32, pixelsY dy: Int32, phase: ScrollPhase, momentum: MomentumPhase = .none) {
+    func scroll(pixelsX dx: Int32, pixelsY dy: Int32, phase: ScrollPhase, momentum: MomentumPhase = .none, extraFlags: CGEventFlags = []) {
         guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         e.setIntegerValueField(Self.scrollPhaseField, value: phase.rawValue)
         e.setIntegerValueField(Self.momentumPhaseField, value: momentum.rawValue)
         stamp(e)
+        e.flags.formUnion(extraFlags)
         e.post(tap: .cghidEventTap)
     }
 
@@ -367,9 +368,23 @@ final class Pointer {
     var freezeUntil = 0.0
     var bias = [0.0, 0.0, 0.0]          // gyro pitch/roll/yaw bias in counts
     var stillCount = 0
+    var gMean = [0.0, 0.0, 0.0], gVar = [100.0, 100.0, 100.0]
+    // Pointer ballistics (Samsung/LG "Magic Remote"-style): smoothed rates, low-speed damping, stillness lock.
+    let filterH = OneEuro(minCutoff: 1.2, beta: 0.015), filterV = OneEuro(minCutoff: 1.2, beta: 0.015)
+    var locked = true, slowSince = 0.0
+    static let lockBelow = 2.5          // °/s: hand this still for `lockAfter` → cursor locks completely
+    static let unlockAbove = 5.0        // °/s: needs a deliberate move to release
+    static let lockAfter = 0.08
+    static let precisionEnd = 9.0       // °/s: below this, motion is progressively damped (fine control, no creep)
+    static let touchSettle = 0.06       // s: ignore the nudge from pressing the thumb down
     var buttons: UInt8 = 0
     var volumeTimer: Timer?
     var siriDownAt = 0.0, siriStartedThisPress = false
+    var siriPending: Timer?
+    // Zoom mode (Play/Pause + Siri held): tilting up/down zooms via ⌃-scroll (macOS Accessibility Zoom).
+    var zoomActive = false
+    var zoomRemainder = 0.0
+    static let zoomPixelsPerDegree = 6.0
     // NX_KEYTYPE_PLAY = 16, FAST = 19, REWIND = 20 (what the F8/F9/F7 media keys send)
     // Play/Pause: 1× play/pause, 2× fast-forward, 3× rewind; hold = cycle this app's windows (⌘`, repeating).
     lazy var playClicks = ClickCounter(
@@ -485,14 +500,30 @@ final class Pointer {
         if !motionActive { log("motion stream on") }
         motionActive = true; lastMotion = t
 
-        // Bias tracking while the remote is at rest.
-        if g.indices.allSatisfy({ abs(g[$0] - bias[$0]) < 25 }) {
+        // Gyro bias: learn only when the remote is genuinely at rest — low variance on every axis over ~0.6 s,
+        // not merely "small" readings (a slow steady turn is small but not still, and learning it causes drift).
+        for i in 0..<3 {
+            gMean[i] += (g[i] - gMean[i]) * 0.08
+            gVar[i] += ((g[i] - gMean[i]) * (g[i] - gMean[i]) - gVar[i]) * 0.08
+        }
+        if (0..<3).allSatisfy({ gVar[$0] < 9 && abs(gMean[$0] - bias[$0]) < 40 }) {
             stillCount += 1
-            if stillCount > 40 { for i in 0..<3 { bias[i] += (g[i] - bias[i]) * 0.02 } }
+            let rate = touching ? 0.02 : 0.08          // resting untouched on a table: converge faster
+            if stillCount > 40 { for i in 0..<3 { bias[i] += (gMean[i] - bias[i]) * rate } }
         } else { stillCount = 0 }
 
         let rawSpeed = hypot((g[0] - bias[0]) / Self.countsPerDPS, (g[2] - bias[2]) / Self.countsPerDPS)
         gyroSpeed += (rawSpeed - gyroSpeed) * 0.3
+        if zoomActive {
+            let r = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
+            var v = abs(r.v) < 2 ? 0 : r.v                        // °/s; tilt up = positive
+            if Defaults.invertY { v = -v }
+            zoomRemainder += v / 66.0 * Self.zoomPixelsPerDegree
+            let px = zoomRemainder.rounded(.towardZero)
+            zoomRemainder -= px
+            if px != 0 { mouse.scroll(pixelsX: 0, pixelsY: Int32(px), phase: .none, extraFlags: .maskControl) }
+            return
+        }
         if switcherActive {
             let r = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
             var deg = abs(r.h) < Self.deadZoneDPS ? 0 : -r.h / 66.0        // same sign as cursor x
@@ -507,11 +538,23 @@ final class Pointer {
         guard Defaults.enabled, touching, pointing, t >= freezeUntil else { return }
         let dt = 1.0 / 66.0
         let rates = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
-        var pitch = rates.v
-        var yaw = rates.h
-        if abs(pitch) < Self.deadZoneDPS { pitch = 0 }
-        if abs(yaw) < Self.deadZoneDPS { yaw = 0 }
-        let speed = hypot(pitch, yaw)                       // °/s
+        guard t - touchBeganAt > Self.touchSettle else { filterH.reset(); filterV.reset(); return }
+        // 1. Adaptive smoothing (1€ filter): heavy at low speed to remove tremor, light when moving fast.
+        var yaw = filterH.filter(rates.h, t: t)
+        var pitch = filterV.filter(rates.v, t: t)
+        var speed = hypot(pitch, yaw)                       // °/s
+        // 2. Stillness lock with hysteresis: a nearly-still hand holds the cursor dead still.
+        if locked {
+            if speed > Self.unlockAbove { locked = false } else { return }
+        } else if speed < Self.lockBelow {
+            if slowSince == 0 { slowSince = t }
+            if t - slowSince > Self.lockAfter { locked = true; slowSince = 0; return }
+        } else { slowSince = 0 }
+        // 3. Precision zone: smoothly damp slow motion (no hard dead-zone edge, no creep).
+        let x = min(max((speed - Self.lockBelow) / (Self.precisionEnd - Self.lockBelow), 0), 1)
+        let damp = x * x * (3 - 2 * x)                      // smoothstep
+        yaw *= damp; pitch *= damp; speed *= damp
+        // 4. Ballistics: faster swings travel further.
         let gain = Defaults.pointerSpeed * (0.6 + Defaults.pointerAccel * min(speed / 120, 2.0))  // px per degree
         var dx = -yaw * dt * gain
         var dy = -pitch * dt * gain
@@ -528,6 +571,7 @@ final class Pointer {
             log("touch down at \(String(format: "%.2f,%.2f", x, y))")
             touchStart = (x, y); smooth = (x, y); lastTouchTime = t
             touchTrail = []; pointedThisTouch = 0; touchBeganAt = t; peakSwipeSpeed = 0; maxGyroDuringTouch = 0
+            locked = true; slowSince = 0; filterH.reset(); filterV.reset()
             mode = .undecided
             scroller.touchBegan()
             if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }
@@ -610,14 +654,37 @@ final class Pointer {
         if let down = went(0x08) { down ? playClicks.down() : playClicks.up() }   // Play/Pause (see playClicks)
         if let down = went(0x01) { down ? tvClicks.down() : tvClicks.up() }       // TV/Home (see tvClicks)
         if let down = went(0x20) { down ? menuClicks.down() : menuClicks.up() }   // Menu (see menuClicks)
+        // Play/Pause + Siri held together = zoom (tilt up/down). Takes over both buttons until both are released.
+        if b & 0x18 == 0x18 && !zoomActive {
+            zoomActive = true
+            siriPending?.invalidate(); siriPending = nil
+            playClicks.cancel()
+            if Dictation.shared.active { Dictation.shared.cancel() }
+            siriStartedThisPress = false
+            if !motionActive { Remote.shared.setMotion(true) }
+            log("zoom mode on")
+        }
+        if zoomActive {
+            if b & 0x18 == 0 { zoomActive = false; log("zoom mode off") }
+            return
+        }
         if let down = went(0x10) {            // Siri → dictation: hold = push-to-talk, quick tap = toggle
             let d = Dictation.shared
             if down {
                 siriDownAt = now()
                 if d.active { d.stop(); siriStartedThisPress = false }
-                else { siriStartedThisPress = d.start() }
-            } else if siriStartedThisPress && now() - siriDownAt > 0.4 {
-                d.stop()
+                else {
+                    // Brief grace period so pressing Play/Pause alongside becomes zoom rather than dictation.
+                    siriPending = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
+                        guard let self else { return }
+                        self.siriPending = nil
+                        self.siriStartedThisPress = d.start()
+                        if self.buttons & 0x10 == 0 && self.siriStartedThisPress { d.stop() }   // already released: tap → keep going
+                    }
+                }
+            } else {
+                if let pending = siriPending { pending.fire() }      // quick tap: start now (toggle mode)
+                else if siriStartedThisPress && now() - siriDownAt > 0.4 { d.stop() }
             }
         }
         for (bit, key) in [(UInt8(0x02), 0), (UInt8(0x04), 1)] {   // Volume → system volume, repeating while held
@@ -635,9 +702,9 @@ final class Pointer {
     func tick() {
         let t = now()
         if motionActive && t - lastMotion > 0.4 { motionActive = false; log("motion stream stopped") }
-        if (touching || switcherActive) && !motionActive && t - lastEnableSent > 0.5 { Remote.shared.setMotion(true) }
+        if (touching || switcherActive || zoomActive) && !motionActive && t - lastEnableSent > 0.5 { Remote.shared.setMotion(true) }
         // Never switch motion off while the app switcher is open; it steers the selection.
-        if motionActive && !touching && !switcherActive && t - lastTouch > 15 { Remote.shared.setMotion(false); motionActive = false }
+        if motionActive && !touching && !switcherActive && !zoomActive && t - lastTouch > 15 { Remote.shared.setMotion(false); motionActive = false }
         // Keep the stream alive during a long switcher hold (re-enable if it stops; refresh every few seconds).
         if switcherActive && t - lastEnableSent > 4 { Remote.shared.setMotion(true) }
         // Failsafe: never leave ⌘ held if the release never arrives.
@@ -856,6 +923,25 @@ final class StatusMenu: NSObject {
     @objc func quit() { Remote.shared.setMotion(false); NSApp.terminate(nil) }
 }
 
+/// 1€ filter (Casiez et al.): a low-pass whose cutoff rises with speed — strong jitter removal when slow,
+/// little lag when fast. Standard for pointing devices.
+final class OneEuro {
+    let minCutoff: Double, beta: Double, dCutoff: Double
+    private var x: Double?, dx = 0.0, lastT = 0.0
+    init(minCutoff: Double, beta: Double, dCutoff: Double = 1.0) { self.minCutoff = minCutoff; self.beta = beta; self.dCutoff = dCutoff }
+    private func alpha(_ cutoff: Double, _ dt: Double) -> Double { let tau = 1 / (2 * .pi * cutoff); return 1 / (1 + tau / dt) }
+    func reset() { x = nil; dx = 0 }
+    func filter(_ value: Double, t: Double) -> Double {
+        guard let prev = x else { x = value; lastT = t; return value }
+        let dt = max(t - lastT, 1.0 / 240); lastT = t
+        let a = alpha(dCutoff, dt)
+        dx = a * ((value - prev) / dt) + (1 - a) * dx
+        let v = alpha(minCutoff + beta * abs(dx), dt) * (value - prev) + prev
+        x = v
+        return v
+    }
+}
+
 /// Counts presses that arrive within the double-click interval of each other, then reports the total once the
 /// sequence ends (or immediately on reaching maxCount).
 /// A press held past `holdAfter` becomes a hold instead: onHold fires (and repeats every `holdRepeat` while held),
@@ -903,6 +989,15 @@ final class ClickCounter {
         }
         if count >= maxCount { fire(); return }
         clickTimer = Timer.scheduledTimer(withTimeInterval: min(NSEvent.doubleClickInterval, 0.35), repeats: false) { [weak self] _ in self?.fire() }
+    }
+
+    /// Abandon the current press sequence (e.g. the button became part of a combo).
+    func cancel() {
+        clickTimer?.invalidate(); clickTimer = nil
+        holdTimer?.invalidate(); holdTimer = nil
+        repeatTimer?.invalidate(); repeatTimer = nil
+        if holding { holding = false; onHoldEnd?() }
+        count = 0
     }
 
     private func fire() {

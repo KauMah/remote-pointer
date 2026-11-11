@@ -67,6 +67,13 @@ final class Dictation {
         finishTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in self?.finish() }
     }
 
+    /// Stop without typing anything (e.g. the Siri press turned into a button combo).
+    func cancel() {
+        guard active else { return }
+        latest = ""
+        finish()
+    }
+
     private func handle(_ result: SFSpeechRecognitionResult?, _ error: Error?) {
         guard active else { return }
         if let result {
