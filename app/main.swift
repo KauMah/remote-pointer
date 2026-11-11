@@ -421,6 +421,7 @@ final class Pointer {
     var clickedThisTouch = false
     static let tapMaxDuration = 0.22, tapMaxMove = 0.06, doubleTapGap = 0.35
     var pinchCandidate = false
+    var lastPos: (x: Double, y: Double) = (0, 0)
     static let pinchStartMove = 0.05            // vertical travel that turns a second touch into a pinch
     static let pinchPerSurface = 2.5            // magnification change for a full-surface drag
     // NX_KEYTYPE_PLAY = 16, FAST = 19, REWIND = 20 (what the F8/F9/F7 media keys send)
@@ -607,7 +608,7 @@ final class Pointer {
         let x = Double(xf), y = Double(yf)
         if down && !touching {                                   // touch began
             log("touch down at \(String(format: "%.2f,%.2f", x, y))")
-            touchStart = (x, y); smooth = (x, y); lastTouchTime = t
+            touchStart = (x, y); smooth = (x, y); lastTouchTime = t; lastPos = (x, y)
             touchTrail = []; pointedThisTouch = 0; touchBeganAt = t; peakSwipeSpeed = 0; maxGyroDuringTouch = 0
             locked = true; slowSince = 0; filterH.reset(); filterV.reset(); clickedThisTouch = false
             mode = .undecided
@@ -634,17 +635,18 @@ final class Pointer {
             if case .undecided = mode { wasPointOrUndecided = true }
             if case .point = mode { wasPointOrUndecided = true }
             if wasPointOrUndecided && !clickedThisTouch && Defaults.enabled && t - touchBeganAt < Self.tapMaxDuration
-                && hypot(x - touchStart.x, y - touchStart.y) < Self.tapMaxMove {
+                && hypot(lastPos.x - touchStart.x, lastPos.y - touchStart.y) < Self.tapMaxMove {   // lift frames report (0,0)
                 if t - lastTapEnd < Self.doubleTapGap + Self.tapMaxDuration {
                     mouse.rewind(0.3)
                     mouse.smartMagnify(); log("double tap → smart zoom"); lastTapEnd = 0
-                } else { lastTapEnd = t }
+                } else { lastTapEnd = t; log("tap") }
             }
             mode = .undecided
         }
         touching = down
         guard down else { return }
         lastTouch = t
+        lastPos = (x, y)
         if !motionActive && t - lastEnableSent > 0.3 { Remote.shared.setMotion(true) }
         guard Defaults.enabled else { return }
 
