@@ -11,15 +11,21 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3</string>
+	<string>0.4</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Hold the Siri Remote's Siri button to dictate; RemotePointer listens through the microphone while it is held.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>RemotePointer links with RemotePointer on your other Macs so scrolling, zoom and dictation follow the pointer across Universal Control.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_rptr._tcp</string>
+	</array>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>RemotePointer turns what you say while holding the Siri button into typed text, on-device.</string>
 </dict>

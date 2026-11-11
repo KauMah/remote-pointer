@@ -150,7 +150,9 @@ final class Mouse {
     static let pixelsPerWheelTick = 12.0
 
     func scroll(pixelsX dx: Int32, pixelsY dy: Int32, phase: ScrollPhase, momentum: MomentumPhase = .none, extraFlags: CGEventFlags = []) {
-        // On another device, only real HID reaches it: send wheel ticks (no gesture phases, so no rubber-banding there).
+        // On another Mac running RemotePointer: send it the scroll to replay with full trackpad fidelity.
+        if Peers.forwarding && Peers.shared.forward(["t": "scroll", "dx": dx, "dy": dy, "p": phase.rawValue, "m": momentum.rawValue]) { return }
+        // On another device without it, only real HID reaches it: send wheel ticks (no gesture phases, so no rubber-banding there).
         // The other Mac applies its own natural-scrolling setting to wheel input, so undo ours.
         if VirtualMouse.shared.remote && VirtualMouse.shared.connected {
             let sign = Defaults.naturalScroll ? -1.0 : 1.0
@@ -183,10 +185,14 @@ final class Mouse {
         e.post(tap: .cghidEventTap)
     }
     /// Two-finger double-tap "smart zoom".
-    func smartMagnify() { gesture(hidType: 22) { _ in } }
+    func smartMagnify() {
+        if Peers.forwarding && Peers.shared.forward(["t": "smart"]) { return }
+        gesture(hidType: 22) { _ in }
+    }
     /// Pinch: phase 1 began, 2 changed, 4 ended; delta is the magnification change (+ zooms in).
     private var remoteZoomAcc = 0.0
     func magnify(phase: Int64, delta: Double) {
+        if Peers.forwarding && Peers.shared.forward(["t": "magnify", "p": phase, "d": delta]) { return }
         // Gesture events can't cross Universal Control; on another device, step browser/app zoom with ⌘= / ⌘− instead.
         if VirtualMouse.shared.remote && VirtualMouse.shared.connected {
             if phase == 1 { remoteZoomAcc = 0 }
@@ -281,6 +287,7 @@ enum SystemAction {
     /// clock is an AXMenuBarItem nested in a group under MenuBarAgent's extras menu bar; older versions host it in
     /// ControlCenter. Search both, preferring an item described "Clock", else the right-most extra.
     static func notificationCenter() {
+        if Peers.forwarding && Peers.shared.forward(["t": "nc"]) { return }
         if VirtualMouse.shared.remote && VirtualMouse.shared.connected { VirtualMouse.shared.tapWithFn(0x11); return }  // fn+N
         func attr(_ e: AXUIElement, _ n: String) -> CFTypeRef? {
             var v: CFTypeRef?
@@ -1081,6 +1088,12 @@ final class StatusMenu: NSObject {
                             action: nil, keyEquivalent: "")
         vm.isEnabled = false
         menu.addItem(vm)
+        let linked = Peers.shared.linked, active = Peers.shared.active
+        let peers = NSMenuItem(title: linked.isEmpty ? "Other Macs: none linked"
+                                      : "Linked: " + linked.map { $0 == active ? "\($0) (pointer here)" : $0 }.joined(separator: ", "),
+                               action: nil, keyEquivalent: "")
+        peers.isEnabled = false
+        menu.addItem(peers)
         menu.addItem(.separator())
         add("Enabled", #selector(toggleEnabled), on: Defaults.enabled)
         menu.addItem(Cheatsheet.menuItem())
@@ -1101,6 +1114,10 @@ final class StatusMenu: NSObject {
         let help = NSMenuItem(title: "Swipe in from the right edge to open, back out over it to close", action: nil, keyEquivalent: "")
         help.isEnabled = false
         menu.addItem(help)
+        menu.addItem(.separator())
+        header("Other Macs (Universal Control)")
+        add("Copy Pairing Key", #selector(copyKey), on: nil)
+        add("Paste Pairing Key from Clipboard", #selector(pasteKey), on: nil)
         menu.addItem(.separator())
         add("Open at Login", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
         add("Quit Remote Pointer", #selector(quit), on: nil, key: "q")
@@ -1125,6 +1142,10 @@ final class StatusMenu: NSObject {
         menu.addItem(i)
     }
 
+    @objc func copyKey() { Peers.shared.copyKey(); Overlay.shared.flash("Pairing key copied — paste it into RemotePointer on your other Mac") }
+    @objc func pasteKey() {
+        Overlay.shared.flash(Peers.shared.pasteKey() ? "Pairing key saved — linking…" : "No RemotePointer pairing key on the clipboard")
+    }
     @objc func toggleEnabled() { Defaults.enabled.toggle(); refresh() }
     @objc func toggleInvertX() { Defaults.invertX.toggle(); refresh() }
     @objc func toggleInvertY() { Defaults.invertY.toggle(); refresh() }
@@ -1257,6 +1278,7 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
 
 StatusMenu.shared.install()
 VirtualMouse.shared.ensureConnected()
+Peers.shared.start()
 // The driver recreates its device when it reloads, which resets acceleration; reapply now and then.
 Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
     if VirtualMouse.shared.ensureConnected() { VirtualMouse.makeLinear() }

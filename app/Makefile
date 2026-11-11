@@ -4,9 +4,9 @@ APP := RemotePointer.app
 SIGN_ID ?= $(shell security find-identity -v -p codesigning | awk '/Apple Development/ {print $$2; exit}')
 INSTALL_DIR := $(HOME)/Applications
 SWIFTFLAGS := -O -swift-version 5 -import-objc-header mt.h
-FRAMEWORKS := -framework IOKit -framework AppKit -framework CoreGraphics -framework ApplicationServices -framework QuartzCore -framework ServiceManagement -framework Speech -framework AVFoundation
+FRAMEWORKS := -framework IOKit -framework AppKit -framework CoreGraphics -framework ApplicationServices -framework QuartzCore -framework ServiceManagement -framework Speech -framework AVFoundation -framework Network
 
-SOURCES := main.swift Dictation.swift VirtualMouse.swift
+SOURCES := main.swift Dictation.swift VirtualMouse.swift Peers.swift
 
 # Info.plist is embedded in the binary too, so `make run` has usage strings for the mic/speech prompts.
 $(BIN): $(SOURCES) mt.h Info.plist

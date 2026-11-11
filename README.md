@@ -78,12 +78,16 @@ sudo ./install.sh "$(make -s pkg)"     # installs the driver + launchd daemons (
 /Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
 ```
 
-Approve the driver in System Settings → General → Login Items & Extensions → Driver Extensions. The menu shows "Universal Control: virtual mouse on" once the app is connected. RemotePointer switches off the system acceleration curve for the virtual mouse only, so its own pointer tuning still applies. Pointer motion, clicks, button shortcuts, media keys and Mission Control go through the virtual mouse and keyboard, so they work on whichever device Universal Control is driving. RemotePointer knows the pointer has left this Mac when the virtual mouse moves and the local cursor doesn't. While the pointer is on the other device:
+Approve the driver in System Settings → General → Login Items & Extensions → Driver Extensions. The menu shows "Universal Control: virtual mouse on" once the app is connected. RemotePointer switches off the system acceleration curve for the virtual mouse only, so its own pointer tuning still applies. Pointer motion, clicks, button shortcuts, media keys and Mission Control go through the virtual mouse and keyboard, so they work on whichever device Universal Control is driving.
 
-- scrolling is sent as wheel ticks (no rubber-banding);
-- pinch zoom becomes ⌘= / ⌘−, and smart zoom isn't available;
+**Install RemotePointer on your other Macs too** (just `make install` in `app/`; they don't need the helper or the driver). The copies find each other over Bonjour. Each one reports when its own cursor moves, so the Mac with the remote knows which machine the pointer is on. Scrolling with momentum, pinch and smart zoom, Notification Center and dictated text are then sent to that Mac's RemotePointer, which plays them back locally exactly as it would there. The link is TLS with a pre-shared key: choose **Copy Pairing Key** on one Mac, then **Paste Pairing Key from Clipboard** on the other (Universal Clipboard carries it across). Macs without the key can't connect.
+
+On a device that isn't running RemotePointer, such as an iPad:
+
+- scrolling falls back to wheel ticks;
+- pinch zoom becomes ⌘= / ⌘−;
 - Notification Center opens with fn+N;
-- dictation types through the virtual keyboard, which handles US-layout ASCII only.
+- dictation types US-layout ASCII through the virtual keyboard.
 
 Root can't read files under `~/Desktop` (macOS privacy protection), so if the repo lives there, copy `helper/` somewhere else before running `install.sh`.
 
@@ -104,7 +108,7 @@ Root can't read files under `~/Desktop` (macOS privacy protection), so if the re
 
 | Path | What |
 |---|---|
-| `app/` | The menu-bar app (`main.swift`, `Dictation.swift`, `VirtualMouse.swift`) |
+| `app/` | The menu-bar app (`main.swift`, `Dictation.swift`, `VirtualMouse.swift`, `Peers.swift`) |
 | `helper/` | Root helper that owns the virtual HID mouse, plus its installer |
 | `probe.swift` | Dumps HID interfaces and reports |
 | `mtprobe.c` | Raw MultitouchSupport touch frames |

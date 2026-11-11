@@ -108,6 +108,7 @@ final class Dictation {
 /// Types text into the focused app as Unicode keyboard events (no clipboard involvement).
 enum Typer {
     static func type(_ text: String) {
+        if Peers.forwarding && Peers.shared.forward(["t": "type", "s": text]) { return }
         // On another device (Universal Control) only the virtual keyboard reaches it; it types ASCII on a US layout.
         if VirtualMouse.shared.remote && VirtualMouse.shared.connected && VirtualMouse.shared.type(text) { return }
         let source = CGEventSource(stateID: .hidSystemState)
