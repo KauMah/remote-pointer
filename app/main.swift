@@ -213,7 +213,11 @@ enum SystemAction {
         return wins.contains { w in
             guard (w[kCGWindowOwnerName as String] as? String) == "Notification Center",
                   let b = w[kCGWindowBounds as String] as? [String: Any], let h = b["Height"] as? Double else { return false }
-            return h > 300
+            guard h > 300 else { return false }
+            let wb = b["Width"] as? Double ?? 0, x = b["X"] as? Double ?? 0, layer = w[kCGWindowLayer as String] as? Int ?? 0
+            let alpha = w[kCGWindowAlpha as String] as? Double ?? 1
+            log("NC window seen: x=\(Int(x)) w=\(Int(wb)) h=\(Int(h)) layer=\(layer) alpha=\(alpha) name=\(w[kCGWindowName as String] ?? "-")")
+            return alpha > 0.1 && layer > 0
         }
     }
 
@@ -620,7 +624,7 @@ final class Pointer {
         }
         if !down && touching {                                   // touch ended
             if case .scroll = mode { log("touch up (scrolled)") } else {
-                log(String(format: "touch up — no scroll: moved %.2f, peak swipe %.2f/s, max gyro %.0f°/s, pointed %.0f px",
+                log("  mode at lift: \(mode)"); log(String(format: "touch up — no scroll: moved %.2f, peak swipe %.2f/s, max gyro %.0f°/s, pointed %.0f px",
                            hypot(smooth.x - touchStart.x, smooth.y - touchStart.y), peakSwipeSpeed, maxGyroDuringTouch, pointedThisTouch))
             }
             if case .scroll = mode { scroller.touchEnded() }
@@ -929,6 +933,74 @@ final class Touch {
 
 // MARK: - Menu bar
 
+/// Controls cheatsheet shown in the menu bar menu. KEEP THIS IN SYNC whenever a control is added or changed.
+enum Cheatsheet {
+    static let sections: [(String, [(String, String)])] = [
+        ("Touch surface", [
+            ("Rest finger + move remote", "Move pointer"),
+            ("Click", "Left click"),
+            ("Swipe", "Scroll (with momentum)"),
+            ("Double-tap", "Smart zoom"),
+            ("Tap, then drag up/down", "Pinch zoom"),
+            ("Swipe in from right edge", "Open Notification Center"),
+            ("Swipe right (while open)", "Close Notification Center"),
+        ]),
+        ("TV / Home", [
+            ("Press", "Right click"),
+            ("Press twice", "Return"),
+            ("Press 3×", "Mission Control"),
+            ("Hold + turn left/right", "App switcher (release to switch)"),
+        ]),
+        ("Play / Pause", [
+            ("Press", "Play / pause"),
+            ("Press twice", "Fast-forward"),
+            ("Press 3×", "Rewind"),
+            ("Hold", "Cycle the app's windows (⌘`)"),
+            ("Hold + Siri, tilt up/down", "Zoom in / out"),
+        ]),
+        ("Menu", [
+            ("Press", "Back (⌘[)"),
+            ("Press twice", "Backspace"),
+            ("Press, then press and hold", "Delete word by word"),
+        ]),
+        ("Siri", [
+            ("Hold", "Dictate while held"),
+            ("Tap", "Start / stop dictation"),
+        ]),
+        ("Volume", [
+            ("+ / −", "System volume (repeats while held)"),
+        ]),
+    ]
+
+    static func menuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Controls Cheatsheet", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .left, location: 230)]
+        let font = NSFont.menuFont(ofSize: 0)
+        for (i, (title, rows)) in sections.enumerated() {
+            if i > 0 { sub.addItem(.separator()) }
+            let h = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            h.attributedTitle = NSAttributedString(string: title, attributes: [.font: NSFont.boldSystemFont(ofSize: font.pointSize)])
+            h.isEnabled = false
+            sub.addItem(h)
+            for (input, action) in rows {
+                let r = NSMenuItem(title: "", action: #selector(Cheatsheet.Target.noop), keyEquivalent: "")
+                r.target = Target.shared
+                let s = NSMutableAttributedString(string: input + "\t", attributes: [.font: font, .paragraphStyle: para, .foregroundColor: NSColor.secondaryLabelColor])
+                s.append(NSAttributedString(string: action, attributes: [.font: font, .paragraphStyle: para, .foregroundColor: NSColor.labelColor]))
+                r.attributedTitle = s
+                sub.addItem(r)
+            }
+        }
+        root.submenu = sub
+        return root
+    }
+
+    // Rows are enabled (so text isn't greyed out) but do nothing when chosen.
+    final class Target: NSObject { static let shared = Target(); @objc func noop() {} }
+}
+
 final class StatusMenu: NSObject {
     static let shared = StatusMenu()
     var item: NSStatusItem?
@@ -949,6 +1021,7 @@ final class StatusMenu: NSObject {
         menu.addItem(status)
         menu.addItem(.separator())
         add("Enabled", #selector(toggleEnabled), on: Defaults.enabled)
+        menu.addItem(Cheatsheet.menuItem())
         menu.addItem(.separator())
         header("Pointer")
         slider("Speed", 10, 120, Defaults.pointerSpeed) { Defaults.pointerSpeed = $0 }
