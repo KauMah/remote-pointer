@@ -146,7 +146,21 @@ final class Mouse {
 
     /// Trackpad-style pixel scroll with gesture/momentum phases, so AppKit treats it like a real trackpad
     /// (smooth scrolling, rubber-banding at edges). Positive dy reveals content above, positive dx content to the left.
+    private var wheelAccX = 0.0, wheelAccY = 0.0
+    static let pixelsPerWheelTick = 12.0
+
     func scroll(pixelsX dx: Int32, pixelsY dy: Int32, phase: ScrollPhase, momentum: MomentumPhase = .none, extraFlags: CGEventFlags = []) {
+        // On another device, only real HID reaches it: send wheel ticks (no gesture phases, so no rubber-banding there).
+        // The other Mac applies its own natural-scrolling setting to wheel input, so undo ours.
+        if VirtualMouse.shared.remote && VirtualMouse.shared.connected {
+            let sign = Defaults.naturalScroll ? -1.0 : 1.0
+            wheelAccX += Double(-dx) * sign / Self.pixelsPerWheelTick
+            wheelAccY += Double(dy) * sign / Self.pixelsPerWheelTick
+            let tx = wheelAccX.rounded(.towardZero), ty = wheelAccY.rounded(.towardZero)
+            wheelAccX -= tx; wheelAccY -= ty
+            if tx != 0 || ty != 0 { VirtualMouse.shared.wheel(x: Int(tx), y: Int(ty)) }
+            return
+        }
         guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         e.setIntegerValueField(Self.scrollPhaseField, value: phase.rawValue)
@@ -171,7 +185,16 @@ final class Mouse {
     /// Two-finger double-tap "smart zoom".
     func smartMagnify() { gesture(hidType: 22) { _ in } }
     /// Pinch: phase 1 began, 2 changed, 4 ended; delta is the magnification change (+ zooms in).
+    private var remoteZoomAcc = 0.0
     func magnify(phase: Int64, delta: Double) {
+        // Gesture events can't cross Universal Control; on another device, step browser/app zoom with ⌘= / ⌘− instead.
+        if VirtualMouse.shared.remote && VirtualMouse.shared.connected {
+            if phase == 1 { remoteZoomAcc = 0 }
+            remoteZoomAcc += delta
+            while remoteZoomAcc > 0.15 { remoteZoomAcc -= 0.15; key(24, flags: .maskCommand) }    // ⌘=
+            while remoteZoomAcc < -0.15 { remoteZoomAcc += 0.15; key(27, flags: .maskCommand) }   // ⌘−
+            return
+        }
         gesture(hidType: 8) { e in
             e.setDoubleValueField(CGEventField(rawValue: 113)!, value: delta)
             e.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
@@ -180,6 +203,9 @@ final class Mouse {
 
     /// System media key (NX_KEYTYPE_SOUND_UP = 0, SOUND_DOWN = 1).
     func mediaKey(_ key: Int) {
+        // NX key type → HID consumer usage: volume up/down, play/pause, next (fast), previous (rewind).
+        let consumer: [Int: UInt16] = [0: 0xE9, 1: 0xEA, 16: 0xCD, 19: 0xB5, 20: 0xB6]
+        if let u = consumer[key], VirtualMouse.shared.ensureConnected() { VirtualMouse.shared.tap(.consumer, u); return }
         for down in [true, false] {
             let flags = down ? 0xA00 : 0xB00
             NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags)),
@@ -192,6 +218,11 @@ final class Mouse {
 
     /// Press or release a modifier key on its own (e.g. hold ⌘ for the app switcher).
     func modifier(_ code: CGKeyCode, _ flag: CGEventFlags, down: Bool) {
+        if VirtualMouse.shared.ensureConnected() {
+            VirtualMouse.shared.setModifier(Self.hidModifiers(flag), down: down)
+            if flag == .maskCommand { commandHeld = down }
+            return
+        }
         guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
         e.type = .flagsChanged
         e.flags = down ? flag : []
@@ -199,7 +230,22 @@ final class Mouse {
         if flag == .maskCommand { commandHeld = down }
     }
 
+    static func hidModifiers(_ f: CGEventFlags) -> UInt8 {
+        var m: UInt8 = 0
+        if f.contains(.maskControl) { m |= VirtualMouse.ctrl }
+        if f.contains(.maskShift) { m |= VirtualMouse.shift }
+        if f.contains(.maskAlternate) { m |= VirtualMouse.option }
+        if f.contains(.maskCommand) { m |= VirtualMouse.command }
+        return m
+    }
+
+    /// Keys go through the virtual keyboard when it's available, so they reach whichever device
+    /// Universal Control is driving.
     func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
+        if let usage = HIDKeys.fromKeyCode[code], VirtualMouse.shared.ensureConnected() {
+            VirtualMouse.shared.tap(usage, modifiers: Self.hidModifiers(flags))
+            return
+        }
         for down in [true, false] {
             let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
             e?.flags = flags
@@ -212,6 +258,7 @@ final class Mouse {
 
 enum SystemAction {
     static func missionControl() {
+        if VirtualMouse.shared.ensureConnected() { VirtualMouse.shared.tap(.appleKeyboard, 0x0010); return }   // Mission Control key
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/System/Applications/Mission Control.app"),
                                            configuration: NSWorkspace.OpenConfiguration())
     }
@@ -234,6 +281,7 @@ enum SystemAction {
     /// clock is an AXMenuBarItem nested in a group under MenuBarAgent's extras menu bar; older versions host it in
     /// ControlCenter. Search both, preferring an item described "Clock", else the right-most extra.
     static func notificationCenter() {
+        if VirtualMouse.shared.remote && VirtualMouse.shared.connected { VirtualMouse.shared.tapWithFn(0x11); return }  // fn+N
         func attr(_ e: AXUIElement, _ n: String) -> CFTypeRef? {
             var v: CFTypeRef?
             return AXUIElementCopyAttributeValue(e, n as CFString, &v) == .success ? v : nil

@@ -78,7 +78,12 @@ sudo ./install.sh "$(make -s pkg)"     # installs the driver + launchd daemons (
 /Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
 ```
 
-Approve the driver in System Settings → General → Login Items & Extensions → Driver Extensions. The menu shows "Universal Control: virtual mouse on" once the app is connected. RemotePointer switches off the system acceleration curve for the virtual mouse only, so its own pointer tuning still applies. Pointer motion and clicks go through the virtual mouse. Scrolling, zoom and keyboard shortcuts are still synthetic, so they act on this Mac.
+Approve the driver in System Settings → General → Login Items & Extensions → Driver Extensions. The menu shows "Universal Control: virtual mouse on" once the app is connected. RemotePointer switches off the system acceleration curve for the virtual mouse only, so its own pointer tuning still applies. Pointer motion, clicks, button shortcuts, media keys and Mission Control go through the virtual mouse and keyboard, so they work on whichever device Universal Control is driving. RemotePointer knows the pointer has left this Mac when the virtual mouse moves and the local cursor doesn't. While the pointer is on the other device:
+
+- scrolling is sent as wheel ticks (no rubber-banding);
+- pinch zoom becomes ⌘= / ⌘−, and smart zoom isn't available;
+- Notification Center opens with fn+N;
+- dictation types through the virtual keyboard, which handles US-layout ASCII only.
 
 Root can't read files under `~/Desktop` (macOS privacy protection), so if the repo lives there, copy `helper/` somewhere else before running `install.sh`.
 
