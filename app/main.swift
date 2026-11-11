@@ -428,24 +428,34 @@ final class Pointer {
         return true
     }
 
-    /// Gyro rates (body frame: x = pitch axis, y = pointing/roll axis, z = face normal) → (horizontal, vertical).
-    /// Motion always comes from the remote's own pitch/yaw rotation (relative motion); the roll rate about the
-    /// pointing axis is never used, so twisting or pointing steeply up/down can't make it drift. Gravity is only
-    /// used to measure how far the remote is twisted (roll angle φ) and rotate the pitch/yaw pair by it, so "up"
-    /// stays up however it's held.
-    var rollAngle = 0.0                          // smoothed φ, radians
+    /// Gyro rates (body frame: x = pitch axis, y = pointing axis, z = face normal) → (horizontal, vertical).
+    ///
+    /// Cursor motion follows how the remote's tip moves relative to the screen, whatever its orientation:
+    /// - vertical = rotation about the screen's left-right axis R (changes the tip's elevation),
+    /// - horizontal = rotation about R × pointing (sweeps the tip sideways).
+    /// Pointing level this is ordinary yaw/pitch with twist corrected; pointing at the ceiling, rotation about the
+    /// screen-facing axis sweeps sideways — so after tilting up 90° and twisting 90°, the remote's own tilt moves
+    /// the cursor left/right and its yaw moves it up/down. Twisting about the pointing axis never moves the cursor.
+    /// The screen direction is the remote's horizontal heading while it points within ~60° of level, frozen
+    /// while it points steeply (where heading is undefined).
+    var screenForward: (x: Double, y: Double) = (0, 1)   // world-horizontal unit vector towards the screen
     func screenRates(_ w: [Double], quat q: (w: Double, x: Double, y: Double, z: Double)?) -> (h: Double, v: Double) {
         guard Defaults.gravityAligned, let q else { return (w[2], w[0]) }
-        // World up in the body frame (third row of the body→world rotation matrix); φ is its angle in the x–z plane.
-        let ux = 2 * (q.x * q.z - q.w * q.y), uz = 1 - 2 * (q.x * q.x + q.y * q.y)
-        if hypot(ux, uz) > 0.35 {                // pointing near straight up/down: keep the last roll angle
-            let target = atan2(ux, uz)
-            var d = target - rollAngle
-            if d > .pi { d -= 2 * .pi } else if d < -.pi { d += 2 * .pi }
-            rollAngle += d * 0.25                 // light smoothing against quaternion jitter
-        }
-        let c = cos(rollAngle), sn = sin(rollAngle)
-        return (h: w[2] * c + w[0] * sn, v: w[0] * c - w[2] * sn)
+        // Body→world rotation matrix (world z = gravity-up).
+        let (qw, qx, qy, qz) = (q.w, q.x, q.y, q.z)
+        let m = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+                 [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+                 [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)]]
+        let ww = (0..<3).map { i in m[i][0] * w[0] + m[i][1] * w[1] + m[i][2] * w[2] }   // ω in world
+        let p = [m[0][1], m[1][1], m[2][1]]                                              // pointing axis in world
+        let horiz = hypot(p[0], p[1])
+        if horiz > 0.5 { screenForward = (p[0] / horiz, p[1] / horiz) }
+        let f = screenForward
+        let r = [f.y, -f.x, 0.0]                                                         // R = F × up
+        let a = [r[1] * p[2] - r[2] * p[1], r[2] * p[0] - r[0] * p[2], r[0] * p[1] - r[1] * p[0]]  // R × p
+        let h = ww[0] * a[0] + ww[1] * a[1] + ww[2] * a[2]
+        let v = ww[0] * r[0] + ww[1] * r[1] + ww[2] * r[2]
+        return (h, v)
     }
 
     func onMotion(gyro g: [Double], quat q: (w: Double, x: Double, y: Double, z: Double)?) {
