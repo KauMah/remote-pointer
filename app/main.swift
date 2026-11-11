@@ -493,6 +493,7 @@ final class Pointer {
     static let rightEdgeStart = 0.72             // touches starting right of this can open Notification Center
                                                  // (the 7-column sensor rarely reports x above ~0.87)
     static let edgeTrigger = 0.25                // leftward travel that fires it
+    static let dismissTrigger = 0.12             // rightward travel that closes it (fires before a scroll can start)
     static let countsPerDPS = 16.4               // ITG-3600 class gyro at ±2000 °/s
     static let deadZoneDPS = 1.5
 
@@ -689,10 +690,11 @@ final class Pointer {
             let inward: Double
             switch g {
             case .notificationCenter: inward = -moved.x          // from the right edge, moving left
-            case .dismissNotificationCenter:                     // from inside, out over the right edge
-                inward = x > Self.rightEdgeStart ? moved.x : 0
+            case .dismissNotificationCenter:                     // any mostly-rightward swipe
+                inward = moved.x > abs(moved.y) ? moved.x : 0
             }
-            if inward > Self.edgeTrigger {
+            let trigger = g == .dismissNotificationCenter ? Self.dismissTrigger : Self.edgeTrigger
+            if inward > trigger {
                 mode = .done
                 mouse.rewind(0.4)
                 fire(g)
@@ -708,7 +710,7 @@ final class Pointer {
     }
 
     func edgeCandidate(_ x: Double, _ y: Double) -> EdgeGesture? {
-        if SystemAction.notificationCenterOpen() { return x < Self.rightEdgeStart ? .dismissNotificationCenter : nil }
+        if SystemAction.notificationCenterOpen() { return .dismissNotificationCenter }   // start anywhere
         return x > Self.rightEdgeStart ? .notificationCenter : nil
     }
 
