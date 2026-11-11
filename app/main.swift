@@ -341,7 +341,7 @@ final class Scroller: NSObject {
     private var coasting = false, coastStarted = false
     private var lastFrame = 0.0
     private var interrupted: (vel: (x: Double, y: Double), axis: Axis, t: Double)?
-    private var link: CADisplayLink?
+    private var link: AnyObject?               // CADisplayLink on macOS 14+; a 120 Hz timer before that
     private var fallbackTimer: Timer?
 
     static let releaseMinSpeed = 150.0          // px/s needed to coast
@@ -422,18 +422,20 @@ final class Scroller: NSObject {
 
     // Display-synchronised momentum frames.
     private func startFrames() {
-        if link == nil, let l = NSScreen.main?.displayLink(target: self, selector: #selector(frame)) {
-            l.add(to: .main, forMode: .common)
-            link = l
+        if #available(macOS 14.0, *) {
+            if link == nil, let l = NSScreen.main?.displayLink(target: self, selector: #selector(frame)) {
+                l.add(to: .main, forMode: .common)
+                link = l
+            }
         }
-        if let link { link.isPaused = false }
+        if #available(macOS 14.0, *), let l = link as? CADisplayLink { l.isPaused = false }
         else if fallbackTimer == nil {
             fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in self?.frame() }
         }
     }
 
     private func stopFrames() {
-        link?.isPaused = true
+        if #available(macOS 14.0, *) { (link as? CADisplayLink)?.isPaused = true }
         fallbackTimer?.invalidate(); fallbackTimer = nil
     }
 

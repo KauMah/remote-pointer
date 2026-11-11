@@ -50,7 +50,7 @@ The same cheatsheet is in the menu bar menu under **Controls Cheatsheet**.
 
 ## Install
 
-Requirements: macOS 14 or later, Xcode command-line tools, and the remote paired to the Mac. To pair, hold **Menu + Volume Up** for a few seconds near the Mac, then open System Settings → Bluetooth.
+Requirements: macOS 13 or later, Xcode command-line tools, and the remote paired to the Mac. To pair, hold **Menu + Volume Up** for a few seconds near the Mac, then open System Settings → Bluetooth.
 
 ```sh
 cd app

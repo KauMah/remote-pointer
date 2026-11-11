@@ -3,7 +3,7 @@ APP := RemotePointer.app
 # A stable signing identity keeps Accessibility/Input Monitoring grants across rebuilds (ad-hoc signing loses them).
 SIGN_ID ?= $(shell security find-identity -v -p codesigning | awk '/Apple Development/ {print $$2; exit}')
 INSTALL_DIR := $(HOME)/Applications
-SWIFTFLAGS := -O -swift-version 5 -import-objc-header mt.h
+SWIFTFLAGS := -O -swift-version 5 -import-objc-header mt.h -target $(shell uname -m)-apple-macos13.0
 FRAMEWORKS := -framework IOKit -framework AppKit -framework CoreGraphics -framework ApplicationServices -framework QuartzCore -framework ServiceManagement -framework Speech -framework AVFoundation -framework Network
 
 SOURCES := main.swift Dictation.swift VirtualMouse.swift Peers.swift
