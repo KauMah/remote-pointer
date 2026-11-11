@@ -62,6 +62,13 @@ final class Mouse {
 
     var location: CGPoint { CGEvent(source: nil)?.location ?? .zero }
 
+    /// Pointer/scroll events take their modifier flags from the source's own remembered key state, which can still
+    /// hold ⌘ from synthetic shortcuts (⌘[, ⌘`, the app switcher) — making clicks ⌘-clicks (Dock → "Show in
+    /// Finder"). Stamp every pointer event with the real current modifier state instead.
+    func stamp(_ e: CGEvent) {
+        e.flags = CGEventSource.flagsState(.hidSystemState).intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn])
+    }
+
     func clampToDisplays(_ p: CGPoint, from: CGPoint) -> CGPoint {
         var id = CGDirectDisplayID(0), count: UInt32 = 0
         if CGGetDisplaysWithPoint(p, 1, &id, &count) == .success, count > 0 { return p }
@@ -84,6 +91,7 @@ final class Mouse {
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: to, mouseButton: .left) else { return }
         e.setIntegerValueField(.mouseEventDeltaX, value: Int64(ix))
         e.setIntegerValueField(.mouseEventDeltaY, value: Int64(iy))
+        stamp(e)
         e.post(tap: .cghidEventTap)
         if record {
             let t = now()
@@ -118,6 +126,7 @@ final class Mouse {
         if button == .left { leftDown = down }
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
         e.setIntegerValueField(.mouseEventClickState, value: Int64(button == .left ? clickCount : 1))
+        stamp(e)
         e.post(tap: .cghidEventTap)
     }
 
@@ -133,6 +142,7 @@ final class Mouse {
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         e.setIntegerValueField(Self.scrollPhaseField, value: phase.rawValue)
         e.setIntegerValueField(Self.momentumPhaseField, value: momentum.rawValue)
+        stamp(e)
         e.post(tap: .cghidEventTap)
     }
 
