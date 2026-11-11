@@ -1,0 +1,18 @@
+# build outputs
+app/remote-pointer
+app/RemotePointer.app/
+c6-probe/build/
+c6-probe/sdkconfig
+c6-probe/sdkconfig.old
+/probe
+/mtprobe
+/brute
+/evmon
+/descdump
+/featread
+/xpctest
+# capture logs (keep the two used as analysis fixtures)
+*.log
+!axes.log
+!enable.log
+.DS_Store

@@ -1,0 +1,917 @@
+// RemotePointer — Siri Remote (1st gen, A1513) as a gyro air-mouse for macOS.
+//
+// Touch the remote's touch surface to engage; while touching, turning the remote moves the cursor (yaw → x,
+// pitch → y). Lift to disengage. Swipe = trackpad-style scroll (axis-locked, with momentum). Swipe left from
+// the right edge = Notification Center. Click the surface = left click,
+// TV = right click (2× Return, 3× Mission Control, hold = app switcher: turn to pick, release to switch), Play/Pause = play/pause (2× fast-forward, 3× rewind,
+// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[), Siri = dictation (hold to talk, tap to toggle). Cursor motion is posted as HID-level mouse
+// events with deltas, so Universal Control can carry it across to a nearby iPad/Mac.
+//
+// How motion is unlocked: BTLEServer forwards feature-report SETs on any of the remote's HID interfaces to the
+// remote's keyhole (report 0xF0). Command A0 01 starts the motion stream: interface FF00/0010, input report 1,
+// 25 bytes = [01][3 × f32 orientation][3 × i16 accel][3 × i16 gyro: pitch, roll, yaw]. A0 00 stops it.
+
+import AppKit
+import IOKit.hid
+import CoreGraphics
+import QuartzCore
+import ServiceManagement
+
+setvbuf(stdout, nil, _IOLBF, 0)
+let debug = CommandLine.arguments.contains("--debug")
+let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemotePointer.log")
+let logHandle: FileHandle? = {
+    guard debug || UserDefaults.standard.bool(forKey: "debugLog") else { return nil }
+    if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
+    let h = try? FileHandle(forWritingTo: logURL); h?.seekToEndOfFile(); return h
+}()
+func log(_ s: @autoclosure () -> String) {
+    guard debug || logHandle != nil else { return }
+    let line = String(format: "%.3f ", CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 1000)) + s()
+    if debug { print(line) }
+    logHandle?.write((line + "\n").data(using: .utf8)!)
+}
+func now() -> Double { CFAbsoluteTimeGetCurrent() }
+
+// MARK: - Settings
+
+enum Defaults {
+    static let d = UserDefaults.standard
+    static var enabled: Bool { get { d.object(forKey: "enabled") as? Bool ?? true } set { d.set(newValue, forKey: "enabled") } }
+    static func num(_ k: String, _ def: Double) -> Double { d.object(forKey: k) as? Double ?? def }
+    static var pointerSpeed: Double { get { num("pointerSpeed", 40) } set { d.set(newValue, forKey: "pointerSpeed") } }
+    static var pointerAccel: Double { get { num("pointerAccel", 1) } set { d.set(newValue, forKey: "pointerAccel") } }
+    static var scrollSpeed: Double { get { num("scrollSpeed", 1000) } set { d.set(newValue, forKey: "scrollSpeed") } }
+    static var scrollGlide: Double { get { num("scrollGlide", 0.6) } set { d.set(newValue, forKey: "scrollGlide") } }
+    static var gravityAligned: Bool { get { d.object(forKey: "gravityAligned") as? Bool ?? true } set { d.set(newValue, forKey: "gravityAligned") } }
+    static var edgeGestures: Bool { get { d.object(forKey: "edgeGestures") as? Bool ?? true } set { d.set(newValue, forKey: "edgeGestures") } }
+    static var invertX: Bool { get { d.bool(forKey: "invertX") } set { d.set(newValue, forKey: "invertX") } }
+    static var invertY: Bool { get { d.bool(forKey: "invertY") } set { d.set(newValue, forKey: "invertY") } }
+    static var naturalScroll: Bool { get { d.object(forKey: "naturalScroll") as? Bool ?? true } set { d.set(newValue, forKey: "naturalScroll") } }
+}
+
+// MARK: - Mouse output
+
+final class Mouse {
+    let source = CGEventSource(stateID: .hidSystemState)
+    var leftDown = false
+    var lastClickTime = 0.0, lastClickPos = CGPoint.zero, clickCount = 1
+    var accX = 0.0, accY = 0.0
+    /// Recently applied deltas, so a click can rewind the wobble the press itself caused.
+    var history: [(t: Double, dx: Double, dy: Double)] = []
+
+    var location: CGPoint { CGEvent(source: nil)?.location ?? .zero }
+
+    func clampToDisplays(_ p: CGPoint, from: CGPoint) -> CGPoint {
+        var id = CGDirectDisplayID(0), count: UInt32 = 0
+        if CGGetDisplaysWithPoint(p, 1, &id, &count) == .success, count > 0 { return p }
+        // Off every display: clamp inside the display we came from (deltas still carry the push for Universal Control).
+        if CGGetDisplaysWithPoint(from, 1, &id, &count) == .success, count > 0 {
+            let b = CGDisplayBounds(id)
+            return CGPoint(x: min(max(p.x, b.minX), b.maxX - 1), y: min(max(p.y, b.minY), b.maxY - 1))
+        }
+        return from
+    }
+
+    func move(dx: Double, dy: Double, record: Bool = true) {
+        accX += dx; accY += dy
+        let ix = accX.rounded(.towardZero), iy = accY.rounded(.towardZero)
+        guard ix != 0 || iy != 0 else { return }
+        accX -= ix; accY -= iy
+        let from = location
+        let to = clampToDisplays(CGPoint(x: from.x + ix, y: from.y + iy), from: from)
+        let type: CGEventType = leftDown ? .leftMouseDragged : .mouseMoved
+        guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: to, mouseButton: .left) else { return }
+        e.setIntegerValueField(.mouseEventDeltaX, value: Int64(ix))
+        e.setIntegerValueField(.mouseEventDeltaY, value: Int64(iy))
+        e.post(tap: .cghidEventTap)
+        if record {
+            let t = now()
+            history.append((t, ix, iy))
+            history.removeAll { t - $0.t > 0.25 }
+        }
+    }
+
+    /// Undo the cursor motion of the last `window` seconds (the press wobble), then forget it.
+    func rewind(_ window: Double) {
+        let t = now()
+        let recent = history.filter { t - $0.t <= window }
+        let (dx, dy) = recent.reduce((0.0, 0.0)) { ($0.0 + $1.dx, $0.1 + $1.dy) }
+        history.removeAll()
+        if dx != 0 || dy != 0 { move(dx: -dx, dy: -dy, record: false) }
+    }
+
+    func button(_ button: CGMouseButton, down: Bool) {
+        let p = location
+        let type: CGEventType
+        switch (button, down) {
+        case (.left, true): type = .leftMouseDown
+        case (.left, false): type = .leftMouseUp
+        case (_, true): type = .rightMouseDown
+        default: type = .rightMouseUp
+        }
+        if button == .left && down {
+            let t = now()
+            clickCount = (t - lastClickTime < NSEvent.doubleClickInterval && hypot(p.x - lastClickPos.x, p.y - lastClickPos.y) < 6) ? clickCount + 1 : 1
+            lastClickTime = t; lastClickPos = p
+        }
+        if button == .left { leftDown = down }
+        guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
+        e.setIntegerValueField(.mouseEventClickState, value: Int64(button == .left ? clickCount : 1))
+        e.post(tap: .cghidEventTap)
+    }
+
+    enum ScrollPhase: Int64 { case none = 0, began = 1, changed = 2, ended = 4, cancelled = 8 }
+    enum MomentumPhase: Int64 { case none = 0, begin = 1, `continue` = 2, end = 3 }
+    static let scrollPhaseField = CGEventField(rawValue: 99)!      // kCGScrollWheelEventScrollPhase
+    static let momentumPhaseField = CGEventField(rawValue: 123)!   // kCGScrollWheelEventMomentumPhase
+
+    /// Trackpad-style pixel scroll with gesture/momentum phases, so AppKit treats it like a real trackpad
+    /// (smooth scrolling, rubber-banding at edges). Positive dy reveals content above, positive dx content to the left.
+    func scroll(pixelsX dx: Int32, pixelsY dy: Int32, phase: ScrollPhase, momentum: MomentumPhase = .none) {
+        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        e.setIntegerValueField(Self.scrollPhaseField, value: phase.rawValue)
+        e.setIntegerValueField(Self.momentumPhaseField, value: momentum.rawValue)
+        e.post(tap: .cghidEventTap)
+    }
+
+    /// System media key (NX_KEYTYPE_SOUND_UP = 0, SOUND_DOWN = 1).
+    func mediaKey(_ key: Int) {
+        for down in [true, false] {
+            let flags = down ? 0xA00 : 0xB00
+            NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags)),
+                               timestamp: 0, windowNumber: 0, context: nil, subtype: 8, data1: (key << 16) | flags, data2: -1)?
+                .cgEvent?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private(set) var commandHeld = false
+
+    /// Press or release a modifier key on its own (e.g. hold ⌘ for the app switcher).
+    func modifier(_ code: CGKeyCode, _ flag: CGEventFlags, down: Bool) {
+        guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
+        e.type = .flagsChanged
+        e.flags = down ? flag : []
+        e.post(tap: .cghidEventTap)
+        if flag == .maskCommand { commandHeld = down }
+    }
+
+    func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
+        for down in [true, false] {
+            let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
+            e?.flags = flags
+            e?.post(tap: .cghidEventTap)
+        }
+    }
+}
+
+// MARK: - System actions (edge gestures)
+
+enum SystemAction {
+    static func missionControl() {
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/System/Applications/Mission Control.app"),
+                                           configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    /// Notification Center has no public API: press the menu-bar Clock (what clicking it does). On current macOS the
+    /// clock is an AXMenuBarItem nested in a group under MenuBarAgent's extras menu bar; older versions host it in
+    /// ControlCenter. Search both, preferring an item described "Clock", else the right-most extra.
+    static func notificationCenter() {
+        func attr(_ e: AXUIElement, _ n: String) -> CFTypeRef? {
+            var v: CFTypeRef?
+            return AXUIElementCopyAttributeValue(e, n as CFString, &v) == .success ? v : nil
+        }
+        func kids(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+        func x(_ e: AXUIElement) -> CGFloat {
+            var p = CGPoint.zero
+            if let v = attr(e, kAXPositionAttribute) { AXValueGetValue(v as! AXValue, .cgPoint, &p) }
+            return p.x
+        }
+        var candidates: [AXUIElement] = []
+        for bid in ["com.apple.MenuBarAgent", "com.apple.controlcenter"] {
+            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bid).first,
+                  let bar = attr(AXUIElementCreateApplication(app.processIdentifier), "AXExtrasMenuBar") else { continue }
+            for top in kids(bar as! AXUIElement) {
+                for e in [top] + kids(top) where (attr(e, kAXRoleAttribute) as? String) == kAXMenuBarItemRole {
+                    let desc = (attr(e, kAXDescriptionAttribute) as? String ?? "") + (attr(e, "AXIdentifier") as? String ?? "")
+                    if desc.localizedCaseInsensitiveContains("clock") {
+                        AXUIElementPerformAction(e, kAXPressAction as CFString); log("notification center: pressed clock"); return
+                    }
+                    candidates.append(e)
+                }
+            }
+        }
+        if let rightmost = candidates.max(by: { x($0) < x($1) }) {
+            AXUIElementPerformAction(rightmost, kAXPressAction as CFString); log("notification center: pressed right-most extra")
+        } else { log("notification center: no menu-bar clock found") }
+    }
+}
+
+// MARK: - Scrolling (trackpad emulation)
+
+/// Turns finger motion on the remote's surface into trackpad-style scrolling: gesture phases, axis lock,
+/// release-velocity momentum with time-based exponential decay on the display refresh, flick compounding,
+/// and touch-to-stop — the behaviours that make a Mac trackpad feel the way it does.
+final class Scroller: NSObject {
+    let mouse: Mouse
+    init(mouse: Mouse) { self.mouse = mouse }
+
+    enum Axis { case vertical, horizontal }
+    private(set) var active = false            // a scroll gesture owns the current touch
+    private var axis: Axis = .vertical
+    private var began = false
+    private var remainder = (x: 0.0, y: 0.0)
+    private var samples: [(t: Double, dx: Double, dy: Double)] = []   // output-space deltas for release velocity
+    private var lastMoveTime = 0.0
+
+    // Momentum
+    private var velocity = (x: 0.0, y: 0.0)    // px/s, output space
+    private var coasting = false, coastStarted = false
+    private var lastFrame = 0.0
+    private var interrupted: (vel: (x: Double, y: Double), axis: Axis, t: Double)?
+    private var link: CADisplayLink?
+    private var fallbackTimer: Timer?
+
+    static let releaseMinSpeed = 150.0          // px/s needed to coast
+    static let stopSpeed = 12.0                 // px/s where coasting ends
+    static let maxSpeed = 14000.0
+
+    /// Per-millisecond velocity retention, from the Glide slider (0…1).
+    var decayPerMs: Double { 0.9955 + 0.003 * Defaults.scrollGlide }
+
+    /// Touch began: catch any coasting scroll (like resting a finger on a trackpad).
+    func touchBegan() {
+        if coasting {
+            interrupted = (velocity, axis, now())
+            endCoast()
+        }
+        active = false; began = false; samples = []; remainder = (0, 0)
+    }
+
+    /// The touch moved far enough to be a scroll: lock the axis from the initial direction. Horizontal needs a
+    /// clearly sideways swipe (within ~27° of horizontal); everything else scrolls vertically.
+    func start(dx: Double, dy: Double) {
+        active = true
+        axis = abs(dx) > 2 * abs(dy) ? .horizontal : .vertical
+        log("scroll start (\(axis))")
+    }
+
+    /// Finger moved by (dx, dy) in surface fractions (x right, y up) over dt seconds.
+    func fingerMoved(dx: Double, dy: Double, dt: Double) {
+        guard active else { return }
+        let base = Defaults.scrollSpeed
+        var ox = dx * base, oy = dy * base
+        let speed = hypot(ox, oy) / max(dt, 0.001)
+        let accel = 1 + min(speed / 2500, 1.5)       // fast swipes travel further
+        ox *= accel; oy *= accel
+        if axis == .vertical { ox = 0 } else { oy = 0 }
+        let t = now()
+        samples.append((t, ox, oy))
+        samples.removeAll { t - $0.t > 0.1 }
+        if ox != 0 || oy != 0 { lastMoveTime = t }
+        emit(fingerX: ox, fingerY: oy, phase: began ? .changed : .began)
+        began = true
+    }
+
+    /// Finger lifted: end the gesture and coast with the release velocity.
+    func touchEnded() {
+        guard active else { return }
+        active = false
+        if began { mouse.scroll(pixelsX: 0, pixelsY: 0, phase: .ended) }
+        let t = now()
+        // Least-squares-free estimate: displacement over the last 100 ms; a pause before lifting means no coast.
+        guard t - lastMoveTime < 0.05, let first = samples.first else { samples = []; return }
+        let span = max(t - first.t, 1.0 / 60)
+        var v = samples.reduce((x: 0.0, y: 0.0)) { (x: $0.x + $1.dx, y: $0.y + $1.dy) }
+        v = (v.x / span, v.y / span)
+        samples = []
+        // Flick again in the same direction while it was still coasting → it builds speed, like a trackpad.
+        if let i = interrupted, i.axis == axis, t - i.t < 0.8,
+           (v.x * i.vel.x > 0 || v.y * i.vel.y > 0) {
+            v = (v.x + i.vel.x * 0.8, v.y + i.vel.y * 0.8)
+        }
+        interrupted = nil
+        let s = hypot(v.x, v.y)
+        guard s > Self.releaseMinSpeed else { return }
+        if s > Self.maxSpeed { v = (v.x * Self.maxSpeed / s, v.y * Self.maxSpeed / s) }
+        velocity = v
+        coasting = true; coastStarted = false; lastFrame = now()
+        startFrames()
+    }
+
+    private func emit(fingerX: Double, fingerY: Double, phase: Mouse.ScrollPhase, momentum: Mouse.MomentumPhase = .none) {
+        let sign = Defaults.naturalScroll ? 1.0 : -1.0
+        let wy = -fingerY * sign + remainder.y     // natural: finger up → content moves up (reveals below)
+        let wx = fingerX * sign + remainder.x      // natural: finger right → content moves right (reveals left)
+        let iy = wy.rounded(.towardZero), ix = wx.rounded(.towardZero)
+        remainder = (wx - ix, wy - iy)
+        mouse.scroll(pixelsX: Int32(ix), pixelsY: Int32(iy), phase: phase, momentum: momentum)
+    }
+
+    // Display-synchronised momentum frames.
+    private func startFrames() {
+        if link == nil, let l = NSScreen.main?.displayLink(target: self, selector: #selector(frame)) {
+            l.add(to: .main, forMode: .common)
+            link = l
+        }
+        if let link { link.isPaused = false }
+        else if fallbackTimer == nil {
+            fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in self?.frame() }
+        }
+    }
+
+    private func stopFrames() {
+        link?.isPaused = true
+        fallbackTimer?.invalidate(); fallbackTimer = nil
+    }
+
+    @objc private func frame() {
+        guard coasting else { stopFrames(); return }
+        let t = now()
+        let dtMs = min((t - lastFrame) * 1000, 50)
+        lastFrame = t
+        let k = pow(decayPerMs, dtMs)
+        velocity = (velocity.x * k, velocity.y * k)
+        if hypot(velocity.x, velocity.y) < Self.stopSpeed { endCoast(); return }
+        emit(fingerX: velocity.x * dtMs / 1000, fingerY: velocity.y * dtMs / 1000, phase: .none,
+             momentum: coastStarted ? .continue : .begin)
+        coastStarted = true
+    }
+
+    private func endCoast() {
+        if coastStarted { mouse.scroll(pixelsX: 0, pixelsY: 0, phase: .none, momentum: .end) }
+        coasting = false; coastStarted = false; velocity = (0, 0)
+        stopFrames()
+    }
+}
+
+// MARK: - Pointer logic
+
+final class Pointer {
+    let mouse = Mouse()
+    lazy var scroller = Scroller(mouse: mouse)
+    var touching = false
+    var motionActive = false            // a motion report arrived recently
+    var lastMotion = 0.0, lastTouch = 0.0, lastEnableSent = 0.0
+    var freezeUntil = 0.0
+    var bias = [0.0, 0.0, 0.0]          // gyro pitch/roll/yaw bias in counts
+    var stillCount = 0
+    var buttons: UInt8 = 0
+    var volumeTimer: Timer?
+    var siriDownAt = 0.0, siriStartedThisPress = false
+    // NX_KEYTYPE_PLAY = 16, FAST = 19, REWIND = 20 (what the F8/F9/F7 media keys send)
+    // Play/Pause: 1× play/pause, 2× fast-forward, 3× rewind; hold = cycle this app's windows (⌘`, repeating).
+    lazy var playClicks = ClickCounter(
+        onClicks: { [unowned self] n in
+            switch n {
+            case 1: self.mouse.mediaKey(16)
+            case 2: self.mouse.mediaKey(19)
+            default: self.mouse.mediaKey(20)
+            }
+        },
+        onHold: { [unowned self] in self.mouse.key(50, flags: .maskCommand) },     // ⌘`
+        holdRepeat: 0.7)
+    // TV/Home: 1× right click, 2× Return, 3× Mission Control; hold = app switcher (turn left/right to pick, release to switch).
+    lazy var tvClicks = ClickCounter(
+        onClicks: { [unowned self] n in
+            switch n {
+            case 1: self.mouse.button(.right, down: true); self.mouse.button(.right, down: false)
+            case 2: self.mouse.key(36)                    // Return
+            default: SystemAction.missionControl()
+            }
+        },
+        onHold: { [unowned self] in
+            self.mouse.modifier(55, .maskCommand, down: true)
+            self.mouse.key(48, flags: .maskCommand)       // ⌘Tab opens the switcher on the next app
+            self.switcherActive = true; self.switcherAccum = 0; self.switcherStart = now()
+            if !self.motionActive { Remote.shared.setMotion(true) }
+        },
+        onHoldEnd: { [unowned self] in
+            self.switcherActive = false
+            self.mouse.modifier(55, .maskCommand, down: false)   // releasing ⌘ switches to the selection
+        })
+    // App switcher: while TV is held, turning the remote left/right moves the selection (faster turn = more apps).
+    var switcherActive = false
+    var switcherAccum = 0.0
+    var switcherStart = 0.0
+    static let switcherStepDegrees = 4.0
+
+    // Touch gesture state
+    enum TouchMode { case undecided, point, scroll, edge(EdgeGesture), done }
+    enum EdgeGesture { case notificationCenter }
+    var mode: TouchMode = .undecided
+    var touchStart: (x: Double, y: Double) = (0, 0)
+    var smooth: (x: Double, y: Double) = (0, 0)
+    var lastTouchTime = 0.0
+
+    // A touch becomes a scroll only for a deliberate swipe. The 7×8 sensor's contact point wanders as the thumb
+    // rolls while the remote is moved, so require: enough travel, made quickly (a swipe, not drift), while the
+    // remote itself is fairly still, and before this touch has been used to point.
+    static let scrollStartDistance = 0.16       // fraction of the surface
+    static let swipeMinSpeed = 0.9              // surface widths per second over the last ~120 ms
+    static let pointingGyroLimit = 35.0         // °/s: above this the user is pointing, not swiping
+    static let pointedLockPixels = 25.0         // once the cursor has moved this far in a touch, it stays a point
+    var touchTrail: [(t: Double, x: Double, y: Double)] = []
+    var gyroSpeed = 0.0                          // smoothed |rotation| in °/s
+    var pointedThisTouch = 0.0
+    static let rightEdgeStart = 0.72             // touches starting right of this can open Notification Center
+                                                 // (the 7-column sensor rarely reports x above ~0.87)
+    static let edgeTrigger = 0.25                // leftward travel that fires it
+    static let countsPerDPS = 16.4               // ITG-3600 class gyro at ±2000 °/s
+    static let deadZoneDPS = 1.5
+
+    var pointing: Bool {
+        if case .scroll = mode { return false }
+        if case .edge = mode { return false }
+        if case .done = mode { return false }
+        return true
+    }
+
+    /// Gyro rates (body frame: x = pitch axis, y = pointing/roll axis, z = face normal) → (horizontal, vertical).
+    /// Motion always comes from the remote's own pitch/yaw rotation (relative motion); the roll rate about the
+    /// pointing axis is never used, so twisting or pointing steeply up/down can't make it drift. Gravity is only
+    /// used to measure how far the remote is twisted (roll angle φ) and rotate the pitch/yaw pair by it, so "up"
+    /// stays up however it's held.
+    var rollAngle = 0.0                          // smoothed φ, radians
+    func screenRates(_ w: [Double], quat q: (w: Double, x: Double, y: Double, z: Double)?) -> (h: Double, v: Double) {
+        guard Defaults.gravityAligned, let q else { return (w[2], w[0]) }
+        // World up in the body frame (third row of the body→world rotation matrix); φ is its angle in the x–z plane.
+        let ux = 2 * (q.x * q.z - q.w * q.y), uz = 1 - 2 * (q.x * q.x + q.y * q.y)
+        if hypot(ux, uz) > 0.35 {                // pointing near straight up/down: keep the last roll angle
+            let target = atan2(ux, uz)
+            var d = target - rollAngle
+            if d > .pi { d -= 2 * .pi } else if d < -.pi { d += 2 * .pi }
+            rollAngle += d * 0.25                 // light smoothing against quaternion jitter
+        }
+        let c = cos(rollAngle), sn = sin(rollAngle)
+        return (h: w[2] * c + w[0] * sn, v: w[0] * c - w[2] * sn)
+    }
+
+    func onMotion(gyro g: [Double], quat q: (w: Double, x: Double, y: Double, z: Double)?) {
+        let t = now()
+        if !motionActive { log("motion stream on") }
+        motionActive = true; lastMotion = t
+
+        // Bias tracking while the remote is at rest.
+        if g.indices.allSatisfy({ abs(g[$0] - bias[$0]) < 25 }) {
+            stillCount += 1
+            if stillCount > 40 { for i in 0..<3 { bias[i] += (g[i] - bias[i]) * 0.02 } }
+        } else { stillCount = 0 }
+
+        let rawSpeed = hypot((g[0] - bias[0]) / Self.countsPerDPS, (g[2] - bias[2]) / Self.countsPerDPS)
+        gyroSpeed += (rawSpeed - gyroSpeed) * 0.3
+        if switcherActive {
+            let r = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
+            var deg = abs(r.h) < Self.deadZoneDPS ? 0 : -r.h / 66.0        // same sign as cursor x
+            if Defaults.invertX { deg = -deg }
+            // Speed decides how far a turn goes: slow = one app per 4°, a fast flick covers several apps.
+            let speed = abs(r.h)                                            // °/s
+            switcherAccum += deg * (1 + min(max(speed - 30, 0) / 80, 2.5))
+            while switcherAccum > Self.switcherStepDegrees { switcherAccum -= Self.switcherStepDegrees; mouse.key(124, flags: .maskCommand) }  // →
+            while switcherAccum < -Self.switcherStepDegrees { switcherAccum += Self.switcherStepDegrees; mouse.key(123, flags: .maskCommand) } // ←
+            return
+        }
+        guard Defaults.enabled, touching, pointing, t >= freezeUntil else { return }
+        let dt = 1.0 / 66.0
+        let rates = screenRates((0..<3).map { (g[$0] - bias[$0]) / Self.countsPerDPS }, quat: q)
+        var pitch = rates.v
+        var yaw = rates.h
+        if abs(pitch) < Self.deadZoneDPS { pitch = 0 }
+        if abs(yaw) < Self.deadZoneDPS { yaw = 0 }
+        let speed = hypot(pitch, yaw)                       // °/s
+        let gain = Defaults.pointerSpeed * (0.6 + Defaults.pointerAccel * min(speed / 120, 2.0))  // px per degree
+        var dx = -yaw * dt * gain
+        var dy = -pitch * dt * gain
+        if Defaults.invertX { dx = -dx }
+        if Defaults.invertY { dy = -dy }
+        pointedThisTouch += abs(dx) + abs(dy)
+        mouse.move(dx: dx, dy: dy)
+    }
+
+    func onTouch(_ down: Bool, x xf: Float, y yf: Float) {
+        let t = now()
+        let x = Double(xf), y = Double(yf)
+        if down && !touching {                                   // touch began
+            log("touch down at \(String(format: "%.2f,%.2f", x, y))")
+            touchStart = (x, y); smooth = (x, y); lastTouchTime = t
+            touchTrail = []; pointedThisTouch = 0
+            mode = .undecided
+            scroller.touchBegan()
+            if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }
+        }
+        if !down && touching {                                   // touch ended
+            log("touch up")
+            if case .scroll = mode { scroller.touchEnded() }
+            mode = .undecided
+        }
+        touching = down
+        guard down else { return }
+        lastTouch = t
+        if !motionActive && t - lastEnableSent > 0.3 { Remote.shared.setMotion(true) }
+        guard Defaults.enabled else { return }
+
+        // Light smoothing: the 7×8 sensor is coarse, raw positions step.
+        let prev = smooth
+        smooth = (prev.x + (x - prev.x) * 0.5, prev.y + (y - prev.y) * 0.5)
+        let dt = max(t - lastTouchTime, 0.001)
+        lastTouchTime = t
+        let moved = (x: x - touchStart.x, y: y - touchStart.y)
+
+        switch mode {
+        case .undecided, .point:
+            touchTrail.append((t, x, y))
+            touchTrail.removeAll { t - $0.t > 0.12 }
+            let recent = touchTrail.first.map { hypot(x - $0.x, y - $0.y) / max(t - $0.t, 0.04) } ?? 0
+            if pointedThisTouch > Self.pointedLockPixels { mode = .point }
+            if case .undecided = mode,
+               hypot(moved.x, moved.y) > Self.scrollStartDistance,
+               recent > Self.swipeMinSpeed,
+               gyroSpeed < Self.pointingGyroLimit {
+                mode = .scroll
+                mouse.rewind(0.25)                               // undo cursor drift from the start of the swipe
+                scroller.start(dx: moved.x, dy: moved.y)
+            }
+        case .scroll:
+            scroller.fingerMoved(dx: smooth.x - prev.x, dy: smooth.y - prev.y, dt: dt)
+        case .edge(let g):
+            let inward = -moved.x                                // from the right edge, moving left
+            if inward > Self.edgeTrigger {
+                mode = .done
+                mouse.rewind(0.4)
+                fire(g)
+            } else if hypot(moved.x, moved.y) > Self.scrollStartDistance && inward < hypot(moved.x, moved.y) * 0.5 {
+                // Moving along the edge rather than inward: treat as a normal scroll.
+                mode = .scroll
+                mouse.rewind(0.25)
+                scroller.start(dx: moved.x, dy: moved.y)
+            }
+        case .done:
+            break
+        }
+    }
+
+    func edgeCandidate(_ x: Double, _ y: Double) -> EdgeGesture? {
+        x > Self.rightEdgeStart ? .notificationCenter : nil
+    }
+
+    func fire(_ g: EdgeGesture) {
+        log("edge gesture: \(g)")
+        switch g {
+        case .notificationCenter: SystemAction.notificationCenter()
+        }
+    }
+
+    func onButtons(_ b: UInt8) {
+        let changed = b ^ buttons
+        buttons = b
+        func went(_ bit: UInt8) -> Bool? { changed & bit == 0 ? nil : (b & bit != 0) }
+        if let down = went(0x80) {            // touch-surface click → left button, rewinding the press wobble
+            if down { mouse.rewind(0.08) }
+            freezeUntil = now() + 0.15
+            mouse.button(.left, down: down)
+        }
+        if let down = went(0x08) { down ? playClicks.down() : playClicks.up() }   // Play/Pause (see playClicks)
+        if let down = went(0x01) { down ? tvClicks.down() : tvClicks.up() }       // TV/Home (see tvClicks)
+        if went(0x20) == true { mouse.key(0x21, flags: .maskCommand) }       // Menu → ⌘[ (Back)
+        if let down = went(0x10) {            // Siri → dictation: hold = push-to-talk, quick tap = toggle
+            let d = Dictation.shared
+            if down {
+                siriDownAt = now()
+                if d.active { d.stop(); siriStartedThisPress = false }
+                else { siriStartedThisPress = d.start() }
+            } else if siriStartedThisPress && now() - siriDownAt > 0.4 {
+                d.stop()
+            }
+        }
+        for (bit, key) in [(UInt8(0x02), 0), (UInt8(0x04), 1)] {   // Volume → system volume, repeating while held
+            guard let down = went(bit) else { continue }
+            volumeTimer?.invalidate(); volumeTimer = nil
+            if down {
+                mouse.mediaKey(key)
+                volumeTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.mouse.mediaKey(key) }
+                volumeTimer?.fireDate = Date().addingTimeInterval(0.4)
+            }
+        }
+    }
+
+    /// Keep motion on while in use; turn it off after a quiet spell to save the remote's battery.
+    func tick() {
+        let t = now()
+        if motionActive && t - lastMotion > 0.4 { motionActive = false; log("motion stream stopped") }
+        if (touching || switcherActive) && !motionActive && t - lastEnableSent > 0.5 { Remote.shared.setMotion(true) }
+        // Never switch motion off while the app switcher is open; it steers the selection.
+        if motionActive && !touching && !switcherActive && t - lastTouch > 15 { Remote.shared.setMotion(false); motionActive = false }
+        // Keep the stream alive during a long switcher hold (re-enable if it stops; refresh every few seconds).
+        if switcherActive && t - lastEnableSent > 4 { Remote.shared.setMotion(true) }
+        // Failsafe: never leave ⌘ held if the release never arrives.
+        if switcherActive && t - switcherStart > 30 { log("switcher failsafe release"); tvClicks.up() }
+    }
+}
+
+let pointer = Pointer()
+
+// MARK: - Remote HID (buttons, motion, keyhole commands)
+
+final class Remote {
+    static let shared = Remote()
+    let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+    var commandDevice: IOHIDDevice?
+    var connected: Bool { commandDevice != nil }
+    var buffers: [UnsafeMutablePointer<UInt8>] = []
+
+    func start() {
+        IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: 0x004C, kIOHIDProductIDKey: 0x0266] as CFDictionary)
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { _, _, _, d in Remote.shared.attach(d) }, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { _, _, _, d in Remote.shared.detach(d) }, nil)
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+    }
+
+    func usage(_ d: IOHIDDevice) -> (Int, Int) {
+        (IOHIDDeviceGetProperty(d, kIOHIDPrimaryUsagePageKey as CFString) as? Int ?? 0,
+         IOHIDDeviceGetProperty(d, kIOHIDPrimaryUsageKey as CFString) as? Int ?? 0)
+    }
+
+    func attach(_ d: IOHIDDevice) {
+        let (page, use) = usage(d)
+        switch (page, use) {
+        case (0x000C, 0x0001):   // buttons: seize so Play/Pause and Volume don't also reach the system
+            var r = IOHIDDeviceOpen(d, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+            if r != kIOReturnSuccess { log("seize buttons failed \(String(format: "0x%08X", UInt32(bitPattern: r))); opening shared"); r = IOHIDDeviceOpen(d, 0) }
+            listen(d) { id, bytes in if id == 0xFA, bytes.count >= 2 { pointer.onButtons(bytes[1]) } }
+        case (0xFF00, 0x0010):   // sensors
+            IOHIDDeviceOpen(d, 0)
+            listen(d) { id, bytes in
+                guard id == 1, bytes.count >= 25 else { return }
+                let g = (0..<3).map { k -> Double in Double(Int16(bitPattern: UInt16(bytes[19 + 2 * k]) | UInt16(bytes[20 + 2 * k]) << 8)) }
+                // Orientation quaternion vector part (x, y, z) as f32; w is implied non-negative.
+                let f: [Double] = (0..<3).map { k in
+                    var v: Float = 0
+                    bytes.withUnsafeBytes { raw in v = raw.loadUnaligned(fromByteOffset: 1 + 4 * k, as: Float.self) }
+                    return Double(v)
+                }
+                let n2 = f[0] * f[0] + f[1] * f[1] + f[2] * f[2]
+                let q = n2 <= 1.0001 && n2.isFinite ? (w: (max(0, 1 - n2)).squareRoot(), x: f[0], y: f[1], z: f[2]) : nil
+                pointer.onMotion(gyro: g, quat: q)
+            }
+        case (0x000C, 0x0004):   // microphone interface: use it to send keyhole commands
+            IOHIDDeviceOpen(d, 0)
+            commandDevice = d
+            log("remote connected")
+            Touch.shared.rescan()
+            StatusMenu.shared.refresh()
+        default: break
+        }
+    }
+
+    func detach(_ d: IOHIDDevice) {
+        if d == commandDevice {
+            commandDevice = nil
+            // The remote went away mid-press: release anything held so ⌘ etc. don't stay stuck down.
+            if pointer.buttons & 0x01 != 0 { pointer.tvClicks.up() }
+            if pointer.buttons & 0x08 != 0 { pointer.playClicks.up() }
+            if pointer.mouse.leftDown { pointer.mouse.button(.left, down: false) }
+            pointer.buttons = 0
+            Touch.shared.attached = false   // the multitouch device is recreated on reconnect
+            log("remote disconnected"); StatusMenu.shared.refresh()
+        }
+    }
+
+    func listen(_ d: IOHIDDevice, _ handler: @escaping (UInt32, [UInt8]) -> Void) {
+        IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 512); buffers.append(buf)
+        let box = Unmanaged.passRetained(HandlerBox(handler)).toOpaque()
+        IOHIDDeviceRegisterInputReportCallback(d, buf, 512, { ctx, _, _, _, id, report, len in
+            let h = Unmanaged<HandlerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            h.fn(id, Array(UnsafeBufferPointer(start: report, count: len)))
+        }, box)
+    }
+
+    func setMotion(_ on: Bool) {
+        guard let d = commandDevice else { return }
+        var payload: [UInt8] = [0xA0, on ? 1 : 0]
+        let r = IOHIDDeviceSetReport(d, kIOHIDReportTypeFeature, 0xA0, &payload, payload.count)
+        pointer.lastEnableSent = now()
+        log("motion \(on ? "on" : "off") → \(String(format: "0x%08X", UInt32(bitPattern: r)))")
+    }
+}
+
+final class HandlerBox { let fn: (UInt32, [UInt8]) -> Void; init(_ f: @escaping (UInt32, [UInt8]) -> Void) { fn = f } }
+
+// MARK: - Touch (private MultitouchSupport) — the clutch
+
+final class Touch {
+    static let shared = Touch()
+    let handle = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
+    var attached = false
+    var lists: [CFArray] = []          // keep device lists (and their devices) alive while callbacks are registered
+
+    func sym<T>(_ name: String, _: T.Type) -> T? {
+        guard let h = handle, let p = dlsym(h, name) else { return nil }
+        return unsafeBitCast(p, to: T.self)
+    }
+
+    func rescan() {
+        guard !attached else { return }
+        guard let create = sym("MTDeviceCreateList", MTDeviceCreateListFn.self),
+              let register = sym("MTRegisterContactFrameCallback", MTRegisterContactFrameCallbackFn.self),
+              let start = sym("MTDeviceStart", MTDeviceStartFn.self),
+              let family = sym("MTDeviceGetFamilyID", MTDeviceGetFamilyIDFn.self),
+              let list = create()?.takeRetainedValue() else { log("MultitouchSupport unavailable"); return }
+        for i in 0..<CFArrayGetCount(list) {
+            guard let dev = CFArrayGetValueAtIndex(list, i) else { continue }
+            let ref = UnsafeMutableRawPointer(mutating: dev)
+            var fam: Int32 = 0
+            _ = family(ref, &fam)
+            guard fam == 160 else { continue }   // 160 = Siri Remote (7×8 sensor)
+            register(ref) { _, touches, n, _, _ in
+                var down = false, x: Float = 0, y: Float = 0
+                if let touches {
+                    for k in 0..<Int(n) where [3, 4].contains(touches[k].state) {
+                        down = true; x = touches[k].normalized.pos.x; y = touches[k].normalized.pos.y; break
+                    }
+                }
+                DispatchQueue.main.async { pointer.onTouch(down, x: x, y: y) }
+                return 0
+            }
+            start(ref, 0)
+            attached = true
+            lists.append(list)
+            log("touch surface attached")
+        }
+    }
+}
+
+// MARK: - Menu bar
+
+final class StatusMenu: NSObject {
+    static let shared = StatusMenu()
+    var item: NSStatusItem?
+    let menu = NSMenu()
+
+    func install() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = NSImage(systemSymbolName: "cursorarrow.motionlines", accessibilityDescription: "Remote Pointer")
+        item.menu = menu
+        self.item = item
+        refresh()
+    }
+
+    func refresh() {
+        menu.removeAllItems()
+        let status = NSMenuItem(title: Remote.shared.connected ? "Siri Remote connected" : "Siri Remote not connected", action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(.separator())
+        add("Enabled", #selector(toggleEnabled), on: Defaults.enabled)
+        menu.addItem(.separator())
+        header("Pointer")
+        slider("Speed", 10, 120, Defaults.pointerSpeed) { Defaults.pointerSpeed = $0 }
+        slider("Acceleration", 0, 2, Defaults.pointerAccel) { Defaults.pointerAccel = $0 }
+        add("Invert Horizontal", #selector(toggleInvertX), on: Defaults.invertX)
+        add("Invert Vertical", #selector(toggleInvertY), on: Defaults.invertY)
+        add("Gravity-Aligned (ignore twist)", #selector(toggleGravity), on: Defaults.gravityAligned)
+        menu.addItem(.separator())
+        header("Scrolling")
+        slider("Speed", 400, 2200, Defaults.scrollSpeed) { Defaults.scrollSpeed = $0 }
+        slider("Momentum", 0, 1, Defaults.scrollGlide) { Defaults.scrollGlide = $0 }
+        add("Natural Scrolling", #selector(toggleNatural), on: Defaults.naturalScroll)
+        menu.addItem(.separator())
+        add("Edge Swipe for Notification Center", #selector(toggleEdges), on: Defaults.edgeGestures)
+        let help = NSMenuItem(title: "Swipe left from the right edge of the touch surface", action: nil, keyEquivalent: "")
+        help.isEnabled = false
+        menu.addItem(help)
+        menu.addItem(.separator())
+        add("Open at Login", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
+        add("Quit Remote Pointer", #selector(quit), on: nil, key: "q")
+    }
+
+    func header(_ title: String) {
+        let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        i.isEnabled = false
+        menu.addItem(i)
+    }
+
+    func slider(_ title: String, _ min: Double, _ max: Double, _ value: Double, _ set: @escaping (Double) -> Void) {
+        let i = NSMenuItem()
+        i.view = SliderView(title: title, min: min, max: max, value: value, onChange: set)
+        menu.addItem(i)
+    }
+
+    func add(_ title: String, _ sel: Selector, on: Bool?, key: String = "") {
+        let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        i.target = self
+        if let on { i.state = on ? .on : .off }
+        menu.addItem(i)
+    }
+
+    @objc func toggleEnabled() { Defaults.enabled.toggle(); refresh() }
+    @objc func toggleInvertX() { Defaults.invertX.toggle(); refresh() }
+    @objc func toggleInvertY() { Defaults.invertY.toggle(); refresh() }
+    @objc func toggleNatural() { Defaults.naturalScroll.toggle(); refresh() }
+    @objc func toggleGravity() { Defaults.gravityAligned.toggle(); refresh() }
+    @objc func toggleEdges() { Defaults.edgeGestures.toggle(); refresh() }
+    @objc func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do { if svc.status == .enabled { try svc.unregister() } else { try svc.register() } }
+        catch { log("login item: \(error)") }
+        refresh()
+    }
+    @objc func quit() { Remote.shared.setMotion(false); NSApp.terminate(nil) }
+}
+
+/// Counts presses that arrive within the double-click interval of each other, then reports the total once the
+/// sequence ends (or immediately on reaching maxCount).
+/// A press held past `holdAfter` becomes a hold instead: onHold fires (and repeats every `holdRepeat` while held),
+/// onHoldEnd fires on release, and any pending clicks are discarded.
+final class ClickCounter {
+    let maxCount: Int
+    let onClicks: (Int) -> Void
+    let onHold: (() -> Void)?
+    let holdRepeat: Double?
+    let onHoldEnd: (() -> Void)?
+    static let holdAfter = 0.45
+    private var count = 0
+    private var clickTimer: Timer?, holdTimer: Timer?, repeatTimer: Timer?
+    private var holding = false
+
+    init(maxCount: Int = 3, onClicks: @escaping (Int) -> Void, onHold: (() -> Void)? = nil,
+         holdRepeat: Double? = nil, onHoldEnd: (() -> Void)? = nil) {
+        self.maxCount = maxCount; self.onClicks = onClicks; self.onHold = onHold
+        self.holdRepeat = holdRepeat; self.onHoldEnd = onHoldEnd
+    }
+
+    func down() {
+        count += 1
+        clickTimer?.invalidate(); clickTimer = nil
+        guard let onHold else { if count >= maxCount { fire() }; return }
+        holdTimer = Timer.scheduledTimer(withTimeInterval: Self.holdAfter, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.holding = true; self.count = 0
+            log("hold")
+            onHold()
+            if let r = self.holdRepeat {
+                self.repeatTimer = Timer.scheduledTimer(withTimeInterval: r, repeats: true) { _ in onHold() }
+            }
+        }
+    }
+
+    func up() {
+        holdTimer?.invalidate(); holdTimer = nil
+        if holding {
+            holding = false
+            repeatTimer?.invalidate(); repeatTimer = nil
+            onHoldEnd?()
+            return
+        }
+        if count >= maxCount { fire(); return }
+        clickTimer = Timer.scheduledTimer(withTimeInterval: min(NSEvent.doubleClickInterval, 0.35), repeats: false) { [weak self] _ in self?.fire() }
+    }
+
+    private func fire() {
+        clickTimer?.invalidate(); clickTimer = nil
+        let n = count; count = 0
+        guard n > 0 else { return }
+        log("click ×\(n)")
+        onClicks(n)
+    }
+}
+
+/// A labelled slider row for the menu.
+final class SliderView: NSView {
+    let onChange: (Double) -> Void
+    init(title: String, min: Double, max: Double, value: Double, onChange: @escaping (Double) -> Void) {
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 28))
+        let label = NSTextField(labelWithString: title)
+        label.font = .menuFont(ofSize: 0)
+        label.frame = NSRect(x: 20, y: 6, width: 90, height: 16)
+        let s = NSSlider(value: value, minValue: min, maxValue: max, target: nil, action: nil)
+        s.frame = NSRect(x: 110, y: 4, width: 135, height: 20)
+        s.isContinuous = true
+        s.target = self
+        s.action = #selector(changed(_:))
+        addSubview(label); addSubview(s)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc func changed(_ s: NSSlider) { onChange(s.doubleValue) }
+}
+
+// MARK: - Main
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
+    print("Grant Accessibility (System Settings → Privacy & Security → Accessibility) so cursor/click events are delivered, then relaunch.")
+}
+
+StatusMenu.shared.install()
+Dictation.shared.requestPermissions()
+Remote.shared.start()
+Touch.shared.rescan()
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in pointer.tick() }
+Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in if Remote.shared.connected { Touch.shared.rescan() } }
+signal(SIGINT) { _ in Remote.shared.setMotion(false); exit(0) }
+print("Remote Pointer running (menu bar). Touch the remote and turn it to point. Ctrl-C to quit.")
+app.run()

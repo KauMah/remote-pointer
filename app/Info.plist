@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.kaumah.remote-pointer</string>
+	<key>CFBundleName</key>
+	<string>RemotePointer</string>
+	<key>CFBundleExecutable</key>
+	<string>remote-pointer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3</string>
+	<key>CFBundleVersion</key>
+	<string>3</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Hold the Siri Remote's Siri button to dictate; RemotePointer listens through the microphone while it is held.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>RemotePointer turns what you say while holding the Siri button into typed text, on-device.</string>
+</dict>
+</plist>
