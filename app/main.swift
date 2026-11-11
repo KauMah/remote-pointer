@@ -4,7 +4,7 @@
 // pitch → y). Lift to disengage. Swipe = trackpad-style scroll (axis-locked, with momentum). Swipe left from
 // the right edge = Notification Center. Click the surface = left click,
 // TV = right click (2× Return, 3× Mission Control, hold = app switcher: turn to pick, release to switch), Play/Pause = play/pause (2× fast-forward, 3× rewind,
-// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle), Play/Pause+Siri held = pinch zoom (tilt), double-tap the surface = smart zoom. Cursor motion is posted as HID-level mouse
+// hold = cycle the app's windows), Volume = system volume, Menu = Back (⌘[) (2× Backspace, 2× and hold = delete words), Siri = dictation (hold to talk, tap to toggle), Play/Pause+Siri held = pinch zoom (tilt), double-tap the surface = smart zoom, tap then drag up/down = pinch zoom. Cursor motion is posted as HID-level mouse
 // events with deltas, so Universal Control can carry it across to a nearby iPad/Mac.
 //
 // How motion is unlocked: BTLEServer forwards feature-report SETs on any of the remote's HID interfaces to the
@@ -410,6 +410,9 @@ final class Pointer {
     var lastTapEnd = 0.0
     var clickedThisTouch = false
     static let tapMaxDuration = 0.22, tapMaxMove = 0.06, doubleTapGap = 0.35
+    var pinchCandidate = false
+    static let pinchStartMove = 0.05            // vertical travel that turns a second touch into a pinch
+    static let pinchPerSurface = 2.5            // magnification change for a full-surface drag
     // NX_KEYTYPE_PLAY = 16, FAST = 19, REWIND = 20 (what the F8/F9/F7 media keys send)
     // Play/Pause: 1× play/pause, 2× fast-forward, 3× rewind; hold = cycle this app's windows (⌘`, repeating).
     lazy var playClicks = ClickCounter(
@@ -457,7 +460,7 @@ final class Pointer {
     static let switcherStepDegrees = 4.0
 
     // Touch gesture state
-    enum TouchMode { case undecided, point, scroll, edge(EdgeGesture), done }
+    enum TouchMode { case undecided, point, scroll, edge(EdgeGesture), pinch, done }
     enum EdgeGesture { case notificationCenter }
     var mode: TouchMode = .undecided
     var touchStart: (x: Double, y: Double) = (0, 0)
@@ -487,6 +490,8 @@ final class Pointer {
         if case .scroll = mode { return false }
         if case .edge = mode { return false }
         if case .done = mode { return false }
+        if case .pinch = mode { return false }
+        if pinchCandidate { return false }          // second touch of a possible double-tap: hold the cursor
         return true
     }
 
@@ -597,6 +602,9 @@ final class Pointer {
             mode = .undecided
             scroller.touchBegan()
             if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }
+            // Touching again right after a tap: either a double-tap (smart zoom) or tap-and-drag (pinch zoom).
+            pinchCandidate = Defaults.enabled && lastTapEnd > 0 && t - lastTapEnd < Self.doubleTapGap
+            if pinchCandidate { mode = .undecided }
         }
         if !down && touching {                                   // touch ended
             if case .scroll = mode { log("touch up (scrolled)") } else {
@@ -604,6 +612,13 @@ final class Pointer {
                            hypot(smooth.x - touchStart.x, smooth.y - touchStart.y), peakSwipeSpeed, maxGyroDuringTouch, pointedThisTouch))
             }
             if case .scroll = mode { scroller.touchEnded() }
+            pinchCandidate = false
+            if case .pinch = mode {
+                mouse.magnify(phase: 4, delta: 0); log("pinch end")
+                mode = .undecided; lastTapEnd = 0
+                touching = down
+                return
+            }
             var wasPointOrUndecided = false
             if case .undecided = mode { wasPointOrUndecided = true }
             if case .point = mode { wasPointOrUndecided = true }
@@ -629,7 +644,21 @@ final class Pointer {
         lastTouchTime = t
         let moved = (x: x - touchStart.x, y: y - touchStart.y)
 
+        if pinchCandidate, case .undecided = mode {
+            if abs(y - touchStart.y) > Self.pinchStartMove {
+                mode = .pinch; pinchCandidate = false
+                mouse.magnify(phase: 1, delta: 0); log("tap-and-drag → pinch")
+            } else if t - touchBeganAt > Self.tapMaxDuration && hypot(x - touchStart.x, y - touchStart.y) < Self.tapMaxMove {
+                // Held still too long for a double-tap and not dragging: it's an ordinary pointing touch.
+                pinchCandidate = false; lastTapEnd = 0
+                touchBeganAt = t                      // restart the touch-settle window
+            }
+            return
+        }
         switch mode {
+        case .pinch:
+            mouse.magnify(phase: 2, delta: (smooth.y - prev.y) * Self.pinchPerSurface)    // finger up = zoom in
+            return
         case .undecided, .point:
             touchTrail.append((t, x, y))
             touchTrail.removeAll { t - $0.t > 0.12 }
