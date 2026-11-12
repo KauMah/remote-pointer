@@ -64,7 +64,7 @@ final class Dictation {
         stopAudio()
         request?.endAudio()
         Overlay.shared.show(latest.isEmpty ? "…" : latest, listening: false)
-        finishTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in self?.finish() }
+        finishTimer = commonTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in self?.finish() }
     }
 
     /// Stop without typing anything (e.g. the Siri press turned into a button combo).
@@ -186,7 +186,7 @@ final class Overlay {
 
     func flash(_ text: String) {
         show(text, listening: false)
-        hideTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in self?.hide() }
+        hideTimer = commonTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in self?.hide() }
     }
 
     func hide() { panel?.orderOut(nil) }

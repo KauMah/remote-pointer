@@ -33,6 +33,14 @@ func log(_ s: @autoclosure () -> String) {
 }
 func now() -> Double { CFAbsoluteTimeGetCurrent() }
 
+/// A main-run-loop timer that keeps firing while a menu is open (event-tracking mode), unlike Timer.scheduledTimer.
+@discardableResult
+func commonTimer(withTimeInterval interval: TimeInterval, repeats: Bool, block: @escaping (Timer) -> Void) -> Timer {
+    let t = Timer(timeInterval: interval, repeats: repeats, block: block)
+    RunLoop.main.add(t, forMode: .common)
+    return t
+}
+
 // MARK: - Settings
 
 enum Defaults {
@@ -430,7 +438,7 @@ final class Scroller: NSObject {
         }
         if #available(macOS 14.0, *), let l = link as? CADisplayLink { l.isPaused = false }
         else if fallbackTimer == nil {
-            fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in self?.frame() }
+            fallbackTimer = commonTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] _ in self?.frame() }
         }
     }
 
@@ -828,7 +836,7 @@ final class Pointer {
                 if d.active { d.stop(); siriStartedThisPress = false }
                 else {
                     // Brief grace period so pressing Play/Pause alongside becomes zoom rather than dictation.
-                    siriPending = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
+                    siriPending = commonTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
                         guard let self else { return }
                         self.siriPending = nil
                         self.siriStartedThisPress = d.start()   // a quick tap leaves it running (toggle mode)
@@ -844,7 +852,7 @@ final class Pointer {
             volumeTimer?.invalidate(); volumeTimer = nil
             if down {
                 mouse.mediaKey(key)
-                volumeTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.mouse.mediaKey(key) }
+                volumeTimer = commonTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.mouse.mediaKey(key) }
                 volumeTimer?.fireDate = Date().addingTimeInterval(0.4)
             }
         }
@@ -879,7 +887,7 @@ final class Remote {
         IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: 0x004C, kIOHIDProductIDKey: 0x0266] as CFDictionary)
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { _, _, _, d in Remote.shared.attach(d) }, nil)
         IOHIDManagerRegisterDeviceRemovalCallback(manager, { _, _, _, d in Remote.shared.detach(d) }, nil)
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
     }
 
     func usage(_ d: IOHIDDevice) -> (Int, Int) {
@@ -933,7 +941,7 @@ final class Remote {
     }
 
     func listen(_ d: IOHIDDevice, _ handler: @escaping (UInt32, [UInt8]) -> Void) {
-        IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 512); buffers.append(buf)
         let box = Unmanaged.passRetained(HandlerBox(handler)).toOpaque()
         IOHIDDeviceRegisterInputReportCallback(d, buf, 512, { ctx, _, _, _, id, report, len in
@@ -1067,7 +1075,7 @@ enum Cheatsheet {
     final class Target: NSObject { static let shared = Target(); @objc func noop() {} }
 }
 
-final class StatusMenu: NSObject {
+final class StatusMenu: NSObject, NSMenuDelegate {
     static let shared = StatusMenu()
     var item: NSStatusItem?
     let menu = NSMenu()
@@ -1076,11 +1084,21 @@ final class StatusMenu: NSObject {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "cursorarrow.motionlines", accessibilityDescription: "Remote Pointer")
         item.menu = menu
+        menu.delegate = self
         self.item = item
         refresh()
     }
 
+    private var isOpen = false, refreshPending = false
+    func menuWillOpen(_ menu: NSMenu) { isOpen = true }
+    func menuDidClose(_ menu: NSMenu) {
+        isOpen = false
+        if refreshPending { refreshPending = false; refresh() }
+    }
+
+    /// Rebuild the menu (deferred while it's open, so status changes don't yank items out from under the pointer).
     func refresh() {
+        if isOpen { refreshPending = true; return }
         menu.removeAllItems()
         let status = NSMenuItem(title: Remote.shared.connected ? "Siri Remote connected" : "Siri Remote not connected", action: nil, keyEquivalent: "")
         status.isEnabled = false
@@ -1207,14 +1225,14 @@ final class ClickCounter {
         count += 1
         clickTimer?.invalidate(); clickTimer = nil
         guard let onHold else { if count >= maxCount { fire() }; return }
-        holdTimer = Timer.scheduledTimer(withTimeInterval: Self.holdAfter, repeats: false) { [weak self] _ in
+        holdTimer = commonTimer(withTimeInterval: Self.holdAfter, repeats: false) { [weak self] _ in
             guard let self else { return }
             let n = self.count
             self.holding = true; self.count = 0
             log("hold after \(n) press(es)")
             onHold(n)
             if let r = self.holdRepeat {
-                self.repeatTimer = Timer.scheduledTimer(withTimeInterval: r, repeats: true) { _ in onHold(n) }
+                self.repeatTimer = commonTimer(withTimeInterval: r, repeats: true) { _ in onHold(n) }
             }
         }
     }
@@ -1228,7 +1246,7 @@ final class ClickCounter {
             return
         }
         if count >= maxCount { fire(); return }
-        clickTimer = Timer.scheduledTimer(withTimeInterval: min(NSEvent.doubleClickInterval, 0.35), repeats: false) { [weak self] _ in self?.fire() }
+        clickTimer = commonTimer(withTimeInterval: min(NSEvent.doubleClickInterval, 0.35), repeats: false) { [weak self] _ in self?.fire() }
     }
 
     /// Abandon the current press sequence (e.g. the button became part of a combo).
@@ -1282,14 +1300,14 @@ StatusMenu.shared.install()
 VirtualMouse.shared.ensureConnected()
 Peers.shared.start()
 // The driver recreates its device when it reloads, which resets acceleration; reapply now and then.
-Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+commonTimer(withTimeInterval: 30, repeats: true) { _ in
     if VirtualMouse.shared.ensureConnected() { VirtualMouse.makeLinear() }
 }
 Dictation.shared.requestPermissions()
 Remote.shared.start()
 Touch.shared.rescan()
-Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in pointer.tick() }
-Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in if Remote.shared.connected { Touch.shared.rescan() } }
+commonTimer(withTimeInterval: 0.1, repeats: true) { _ in pointer.tick() }
+commonTimer(withTimeInterval: 2, repeats: true) { _ in if Remote.shared.connected { Touch.shared.rescan() } }
 signal(SIGINT) { _ in Remote.shared.setMotion(false); exit(0) }
 print("Remote Pointer running (menu bar). Touch the remote and turn it to point. Ctrl-C to quit.")
 app.run()
