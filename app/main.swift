@@ -482,10 +482,17 @@ final class Pointer {
     // Pointer ballistics (Samsung/LG "Magic Remote"-style): smoothed rates, low-speed damping, stillness lock.
     let filterH = OneEuro(minCutoff: 1.2, beta: 0.015), filterV = OneEuro(minCutoff: 1.2, beta: 0.015)
     var locked = true, slowSince = 0.0
-    static let lockBelow = 2.5          // °/s: hand this still for `lockAfter` → cursor locks completely
-    static let unlockAbove = 5.0        // °/s: needs a deliberate move to release
-    static let lockAfter = 0.08
+    static let lockBelow = 1.8          // °/s: hand this still for `lockAfter` → cursor locks completely
+    static let unlockAbove = 5.0        // °/s: a quick deliberate move releases at once
+    static let lockAfter = 0.15
     static let precisionEnd = 9.0       // °/s: below this, motion is progressively damped (fine control, no creep)
+    static let precisionFloor = 0.3     // slowest motion still moves at this fraction of normal gain
+    // A slow, small, deliberate nudge never reaches `unlockAbove`, but it does turn the remote steadily one way;
+    // tremor jiggles back and forth around a point. So while locked, integrate rotation (leaking, so residual gyro
+    // bias can't build up) and release once it has turned this far in one direction.
+    static let unlockDegrees = 0.3
+    static let unlockLeak = 0.6         // s: time constant of that integral
+    var lockedAngle: (h: Double, v: Double) = (0, 0)
     static let touchSettle = 0.06       // s: ignore the nudge from pressing the thumb down
     var buttons: UInt8 = 0
     var volumeTimer: Timer?
@@ -662,16 +669,31 @@ final class Pointer {
         var speed = hypot(pitch, yaw)                       // °/s
         // 2. Stillness lock with hysteresis: a nearly-still hand holds the cursor dead still.
         if locked {
-            if speed > Self.unlockAbove { locked = false } else { return }
+            let leak = exp(-dt / Self.unlockLeak)
+            lockedAngle = (lockedAngle.h * leak + yaw * dt, lockedAngle.v * leak + pitch * dt)
+            if speed > Self.unlockAbove {
+                locked = false; lockedAngle = (0, 0)
+            } else if hypot(lockedAngle.h, lockedAngle.v) > Self.unlockDegrees {
+                // Released by a small deliberate turn: apply the turn itself, at precision gain, so it isn't lost.
+                locked = false; slowSince = 0
+                emit(yaw: lockedAngle.h / dt * Self.precisionFloor, pitch: lockedAngle.v / dt * Self.precisionFloor, speed: 0, dt: dt)
+                lockedAngle = (0, 0)
+                return
+            } else { return }
         } else if speed < Self.lockBelow {
             if slowSince == 0 { slowSince = t }
-            if t - slowSince > Self.lockAfter { locked = true; slowSince = 0; return }
+            if t - slowSince > Self.lockAfter { locked = true; slowSince = 0; lockedAngle = (0, 0); return }
         } else { slowSince = 0 }
-        // 3. Precision zone: smoothly damp slow motion (no hard dead-zone edge, no creep).
+        // 3. Precision zone: smoothly damp slow motion (no hard dead-zone edge, no creep), never below the floor.
         let x = min(max((speed - Self.lockBelow) / (Self.precisionEnd - Self.lockBelow), 0), 1)
-        let damp = x * x * (3 - 2 * x)                      // smoothstep
+        let damp = Self.precisionFloor + (1 - Self.precisionFloor) * x * x * (3 - 2 * x)   // smoothstep
         yaw *= damp; pitch *= damp; speed *= damp
-        // 4. Ballistics: faster swings travel further.
+        emit(yaw: yaw, pitch: pitch, speed: speed, dt: dt)
+    }
+
+    /// Ballistics: damped screen rates (°/s) → cursor motion.
+    private func emit(yaw: Double, pitch: Double, speed: Double, dt: Double) {
+        // Faster swings travel further.
         let gain = Defaults.pointerSpeed * (0.6 + Defaults.pointerAccel * min(speed / 120, 2.0))  // px per degree
         var dx = -yaw * dt * gain
         var dy = -pitch * dt * gain
@@ -688,7 +710,7 @@ final class Pointer {
             log("touch down at \(String(format: "%.2f,%.2f", x, y))")
             touchStart = (x, y); smooth = (x, y); lastTouchTime = t; lastPos = (x, y)
             touchTrail = []; pointedThisTouch = 0; touchBeganAt = t; peakSwipeSpeed = 0; maxGyroDuringTouch = 0
-            locked = true; slowSince = 0; filterH.reset(); filterV.reset(); clickedThisTouch = false
+            locked = true; slowSince = 0; lockedAngle = (0, 0); filterH.reset(); filterV.reset(); clickedThisTouch = false
             mode = .undecided
             scroller.touchBegan()
             if Defaults.edgeGestures { mode = edgeCandidate(x, y).map { .edge($0) } ?? .undecided }

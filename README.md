@@ -43,7 +43,7 @@ The same cheatsheet is in the menu bar menu under **Controls Cheatsheet**.
 ## How the pointer feels right
 
 - **Screen-relative mapping.** The remote reports its orientation as a quaternion with gravity as world-up. Rotation is projected onto the screen's right and up axes, so "up" always moves the cursor up, however the remote is twisted or angled. If you point it at the ceiling and roll it 90°, tilting still moves the cursor sideways.
-- **Drift-free when still.** A 1€ filter removes hand tremor. A stillness lock with hysteresis holds the cursor dead still when your hand is nearly steady, and a smooth precision zone damps slow movement. The gyro bias is relearned only when the variance shows the remote is truly at rest.
+- **Drift-free when still.** A 1€ filter removes hand tremor. A stillness lock holds the cursor dead still when your hand is nearly steady. It releases on a quick move, or on a small slow turn that keeps going one way, since tremor only jiggles back and forth. Slow movement is damped for precision but never to zero, so tiny nudges onto a small close button still register. The gyro bias is relearned only when the variance shows the remote is truly at rest.
 - **Ballistics.** Faster swings travel further, like a mouse with acceleration.
 - **Click stability.** Pressing the touch surface rewinds the last ~80 ms of motion and briefly freezes the cursor, so the press doesn't nudge your target.
 - **Scroll vs. point.** A touch scrolls only when the finger travels far and fast enough while the remote is mostly still. Otherwise it's a pointing touch.
